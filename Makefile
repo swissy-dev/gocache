@@ -1,0 +1,16 @@
+.PHONY: test lint vet race integration
+
+test:
+	go test ./...
+
+race:
+	go test -race ./...
+
+vet:
+	go vet ./...
+
+lint:
+	golangci-lint run --build-tags=integration ./...
+
+integration:
+	go test -race -tags integration ./...
