@@ -34,10 +34,15 @@ misconfiguration rather than a useful setting.
 is full, the least recently used entry is dropped to make room.
 
 **Lazy expiry.** Expired entries are removed when something touches that key — a `Get`, `Add` or
-`Delete` — not by a background sweeper. LRU eviction is a separate mechanism: when the driver is
-over capacity it drops whatever is at the back of the LRU list, expired or not, rather than seeking
-out expired entries specifically. An expired entry can sit in its slot, unreadable but still
-counted against `WithMaxEntries`, until a touch removes it or eviction happens to reach it.
+`Delete` — not by a background sweeper.
+
+**Eviction reclaims before it discards.** When the driver is over capacity it first inspects a small
+fixed window at the cold end of the LRU list and drops any expired entries it finds there; only if
+that frees nothing does it evict the least recently used entry. The window is deliberately fixed, so
+the work per write is constant no matter how large the cache is — scanning the whole list to hunt
+for expired entries would make every write O(n) under the driver's lock. An expired entry deeper in
+the list still occupies its slot, unreadable but counted against `WithMaxEntries`, until a touch
+removes it or it drifts to the cold end.
 
 **Real wall clock.** The driver expires against `time.Now()`, not the cache's injected
 [clock](/concepts/expiry). This is what makes the [testing pattern](/guides/testing) work: advancing

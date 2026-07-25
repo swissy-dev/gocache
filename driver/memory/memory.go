@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const expiryScanWindow = 8
+
 type Option func(*Driver)
 
 func WithMaxEntries(n int) Option {
@@ -73,9 +75,10 @@ func (d *Driver) Set(ctx context.Context, key string, value []byte, ttl time.Dur
 func (d *Driver) set(key string, value []byte, ttl time.Duration) {
 	v := make([]byte, len(value))
 	copy(v, value)
+	now := time.Now()
 	var exp time.Time
 	if ttl > 0 {
-		exp = time.Now().Add(ttl)
+		exp = now.Add(ttl)
 	}
 	if el, ok := d.items[key]; ok {
 		en := el.Value.(*entry)
@@ -87,7 +90,7 @@ func (d *Driver) set(key string, value []byte, ttl time.Duration) {
 	el := d.lru.PushFront(&entry{key: key, value: v, expiresAt: exp})
 	d.items[key] = el
 	if len(d.items) > d.maxEntries {
-		d.removeExpired()
+		d.reclaimExpiredFromColdEnd(now, expiryScanWindow)
 	}
 	for len(d.items) > d.maxEntries {
 		back := d.lru.Back()
@@ -98,9 +101,9 @@ func (d *Driver) set(key string, value []byte, ttl time.Duration) {
 	}
 }
 
-func (d *Driver) removeExpired() {
-	now := time.Now()
-	for el := d.lru.Back(); el != nil; {
+func (d *Driver) reclaimExpiredFromColdEnd(now time.Time, window int) {
+	el := d.lru.Back()
+	for i := 0; i < window && el != nil; i++ {
 		prev := el.Prev()
 		if el.Value.(*entry).expired(now) {
 			d.remove(el)

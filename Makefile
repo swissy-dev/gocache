@@ -1,4 +1,4 @@
-.PHONY: test lint vet race integration
+.PHONY: test lint vet race integration bench
 
 test:
 	go test ./...
@@ -14,3 +14,6 @@ lint:
 
 integration:
 	go test -race -tags integration ./...
+
+bench:
+	go test -run '^$$' -bench . -benchmem ./...
