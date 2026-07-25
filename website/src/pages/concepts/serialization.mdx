@@ -1,0 +1,124 @@
+# Serialization
+
+gocache stores bytes. Your Go values become bytes through a codec, and those bytes are embedded in
+an envelope alongside the metadata that makes tags and grace work.
+
+## The envelope
+
+Every entry is a small JSON document:
+
+```json
+{ "v": { "id": 42, "name": "Ada" }, "c": 1690000000000, "x": 1690000060000, "t": ["users"] }
+```
+
+- `v` — your value, embedded verbatim
+- `c` — created-at, unix milliseconds
+- `x` — logical expiry, unix milliseconds (`0` means no expiry)
+- `t` — tags, omitted when there are none
+
+Freshness needs no second lookup — comparing `x` against the clock answers "is this fresh?" using
+only the envelope itself. Tag validity is different: confirming a tag hasn't been invalidated costs
+one marker lookup per tag (see [Tags](/features/tags)), which is why those markers are themselves
+cached rather than read fresh on every use.
+
+## The default codec
+
+`encoding/json`. Your values need to round-trip through it, which in practice means exported fields
+and struct tags:
+
+```go
+type User struct {
+	ID    int       `json:"id"`
+	Name  string    `json:"name"`
+	Roles []string  `json:"roles"`
+	Seen  time.Time `json:"seen"`
+}
+```
+
+The usual `encoding/json` rules apply, and they are worth stating because a cache makes them easy to
+forget:
+
+- Unexported fields are not stored, and come back zeroed.
+- `map[string]any` values lose their concrete types — numbers come back as `float64`.
+- A `time.Time` survives, but its monotonic clock reading does not.
+- Cyclic structures fail to marshal, and the error surfaces from `Set`.
+
+If a value cannot round-trip cleanly, cache a representation that can. A dedicated cache struct is
+usually clearer than making your domain type serialisable.
+
+## Type safety
+
+Read and write are generic, so the type you get back is the type you asked for:
+
+```go
+user, found, err := gocache.Get[User](ctx, cache, "user:42")
+```
+
+The type parameter is not stored, though. It describes how to *decode* the bytes, not what was
+encoded — nothing prevents writing a `User` and reading it back as an `Order` if the JSON happens to
+be compatible. Keep one type per key.
+
+## Custom codecs
+
+`WithCodec` swaps the encoder:
+
+```go
+type Codec interface {
+	Marshal(v any) ([]byte, error)
+	Unmarshal(data []byte, v any) error
+}
+```
+
+:::warning[A codec must produce valid JSON]
+Values are embedded verbatim in a JSON envelope, so the codec's output has to be valid JSON. A
+msgpack, gob or protobuf codec produces bytes the envelope cannot contain.
+
+`New` catches the common case at construction: it marshals a single probe value through your codec
+and returns an error if the result is not valid JSON. That is a spot check, not a guarantee — a
+codec that passes the probe but emits non-JSON output for some other value will still construct.
+It also is not the only thing standing between you and a loud failure: even without the probe, a
+non-JSON codec makes plain `Set` fail immediately, because `encoding/json` rejects an invalid
+envelope at encode time. The case the probe actually guards against is `GetOrSet`, which swallows
+write errors — without the probe, a non-JSON codec paired with `GetOrSet` would cache nothing while
+silently appearing to work.
+:::
+
+So the useful cases for `WithCodec` are alternative *JSON* producers — a faster library, or a
+wrapper that applies your own conventions:
+
+```go
+type sonicCodec struct{}
+
+func (sonicCodec) Marshal(v any) ([]byte, error)      { return sonic.Marshal(v) }
+func (sonicCodec) Unmarshal(b []byte, v any) error    { return sonic.Unmarshal(b, v) }
+
+cache, err := gocache.New(
+	gocache.WithL1(memory.New()),
+	gocache.WithCodec(sonicCodec{}),
+)
+```
+
+If you need binary encoding, encode to bytes yourself and cache a JSON-safe wrapper — a struct with
+a `[]byte` field, which `encoding/json` renders as base64.
+
+## Size
+
+gocache does not limit entry size; the driver does. Redis accepts values up to 512 MB but you should
+not go anywhere near that. The SQL driver stores values in a `BYTEA`/`BLOB` column. The memory
+driver counts *entries*, not bytes, so ten thousand large values will happily consume far more
+memory than ten thousand small ones — size your `WithMaxEntries` against what you actually store.
+
+Very large values in a two-tier cache are doubly expensive: they occupy the shared store and a copy
+in every instance's L1. Consider `WithSkipL1` for those.
+
+## Value copies
+
+Values are serialised on write and deserialised on read, so a value that actually goes through that
+round trip comes back as a fresh copy: mutating it does not affect the cached entry, and mutating a
+value after writing it does not change what was stored. The memory driver copies the bytes it is
+handed, so it does not alias your slice either.
+
+That does not hold for callers sharing a `GetOrSet` flight. They all receive the exact value the
+factory returned — not a separately decoded copy each — so if that value is a slice, map, or
+pointer, every waiter on the flight shares the same one. Mutating a value returned by `GetOrSet` can
+therefore be visible to other callers that were waiting on it; treat what you get back as read-only.

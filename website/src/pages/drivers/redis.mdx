@@ -1,0 +1,119 @@
+# Redis driver
+
+Backed by [go-redis](https://github.com/redis/go-redis) v9. The usual choice for L2.
+
+```go
+import (
+	"github.com/swissy-dev/gocache"
+	"github.com/swissy-dev/gocache/driver/memory"
+	redisdriver "github.com/swissy-dev/gocache/driver/redisdriver"
+	"github.com/redis/go-redis/v9"
+)
+
+client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+
+cache, err := gocache.New(
+	gocache.WithL1(memory.New()),
+	gocache.WithL2(redisdriver.New(client)),
+)
+```
+
+`New` takes a `redis.UniversalClient`, so a single node, a cluster or a sentinel setup all work
+unchanged.
+
+## The client is yours
+
+gocache never closes the client and never reconfigures it. Pooling, timeouts, TLS and retries are
+your settings — which also means the same client can serve your application and the cache.
+
+Close it after the cache:
+
+```go
+defer client.Close()
+defer func() { _ = cache.Close() }()
+```
+
+## Command mapping
+
+| Operation | Redis |
+|---|---|
+| Read | `GET` |
+| Write | `SET` with `EX` or `PX` (go-redis picks by precision), or without expiry when the TTL is zero |
+| Set-if-absent (locks) | `SET NX` with `EX` or `PX` chosen the same way, or without expiry when the TTL is zero |
+| Delete | `DEL` |
+| Compare-and-delete (lock release) | Lua script comparing the value before `DEL` |
+| Clear a prefix | `SCAN MATCH <prefix>*` plus batched `DEL` |
+
+Two details worth knowing. Lock release runs as a Lua script so the compare and the delete are
+atomic — that is what makes [owner tokens](/features/locks) safe. And prefix clearing escapes glob
+metacharacters, so a key containing `*` cannot widen the match and delete unrelated keys.
+
+## Clearing
+
+:::danger[Clear on a root cache is effectively FLUSHDB]
+Prefix clearing with an empty prefix becomes `SCAN MATCH *` plus `DEL` — and a root cache has an
+empty prefix. `cache.Clear(ctx)` on a root cache deletes **every key in the selected logical
+database**, including keys gocache never wrote: your sessions, queues, rate limiters, everything.
+
+Two ways to make this safe, and you want at least one:
+
+```go
+// Scope the clear to a namespace.
+err := cache.Namespace("cache").Clear(ctx)
+
+// Or give the cache its own logical database.
+client := redis.NewClient(&redis.Options{Addr: "localhost:6379", DB: 1})
+```
+:::
+
+`SCAN` also gives no snapshot guarantee: keys written while a clear is running may or may not be
+removed. It is a best-effort bulk delete, not a transaction.
+
+## Expiry and eviction
+
+Redis expires keys itself using the TTL gocache sets, so there is no sweeper and no cleanup for you
+to schedule.
+
+Your server's `maxmemory-policy` still applies. Under memory pressure Redis may evict cache entries
+early, which gocache sees as an ordinary miss. If you run the cache in a database shared with data
+you cannot afford to lose, `volatile-lru` — which only evicts keys that have a TTL — is the policy
+that matches how gocache writes.
+
+An entry written with no expiry has no TTL in Redis and will not be evicted under `volatile-*`
+policies. Deliberate, but worth remembering before caching many of them forever.
+
+## Failure
+
+A Redis outage does not corrupt anything. Reads fail with the driver's error wrapped, and if you
+have an L1 the cache still serves whatever is fresh there — a miss in L1 that cannot reach L2
+returns the error rather than a stale local copy.
+
+[Grace periods](/features/grace-periods) do **not** cover this: grace catches factory failures, not
+tier failures. A Redis outage surfaces as a Redis error.
+
+## Using it for the bus too
+
+The same client can back the [bus](/bus/overview):
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(memory.New()),
+	gocache.WithL2(redisdriver.New(client)),
+	gocache.WithBus(redisbus.New(client)),
+)
+```
+
+go-redis manages subscriptions on their own connections, so sharing the client between driver and
+bus is fine and is the normal setup.
+
+## Testing
+
+The driver is exercised in gocache's own test suite against
+[miniredis](https://github.com/alicebob/miniredis) for unit tests and against real Redis behind a
+build tag — real Redis matters because miniredis does run the lock's script on a genuine Lua VM, but
+`redis.call` inside it dispatches into miniredis's own reimplementation of each command rather than
+Redis's actual Lua sandbox. What it emulates is Redis, not Lua, and the lock release script depends
+on the real thing.
+
+For your own tests, prefer the [memory driver](/drivers/memory) and keep Redis for integration
+tests.

@@ -1,0 +1,221 @@
+# Testing
+
+Code that uses gocache should be testable without Redis, without Docker, and without sleeping.
+
+## Use a real cache
+
+The memory driver is fast enough that faking the cache buys you nothing but a worse test:
+
+```go
+func newTestCache(t *testing.T) *gocache.Cache {
+	t.Helper()
+
+	cache, err := gocache.New(gocache.WithL1(memory.New()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cache.Close() })
+	return cache
+}
+```
+
+A real cache exercises the real serialization path, so a type that cannot round-trip through JSON
+fails in a unit test rather than in production.
+
+## Disabling the cache
+
+Sometimes you want to prove your code is correct when nothing is cached. The
+[null driver](/drivers/null) turns caching off without touching call sites:
+
+```go
+cache, err := gocache.New(gocache.WithL1(null.New()))
+```
+
+Every read misses and every factory runs. Useful for asserting that a handler still works with a
+cold cache, and for isolating whether a bug is in your logic or your invalidation.
+
+Remember that locks on a null-backed cache always acquire — do not use it to test code that relies
+on mutual exclusion.
+
+## Controlling time
+
+Do not sleep. Inject a clock:
+
+```go
+func TestUserCacheExpires(t *testing.T) {
+	now := time.Now()
+	cache, err := gocache.New(
+		gocache.WithL1(memory.New()),
+		gocache.WithClock(func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cache.Close() }()
+
+	ctx := context.Background()
+	if err := gocache.Set(ctx, cache, "user:42", user, gocache.WithTTL(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	now = now.Add(2 * time.Minute)
+
+	if _, found, err := gocache.Get[User](ctx, cache, "user:42"); err != nil || found {
+		t.Fatalf("expected the entry to have expired: found=%v err=%v", found, err)
+	}
+}
+```
+
+`WithClock` governs logical expiry — the envelope timestamps, tag comparisons and grace windows.
+Tests become instant and deterministic.
+
+:::warning[The closure needs a mutex once GetOrSet is involved]
+`GetOrSet`'s factory always runs on a separate goroutine — `runFlight` executes inside
+`singleflight.DoChan`, which spawns one regardless of configuration — so the clock can be read off
+the caller's goroutine on every `GetOrSet` call, not only when a soft timeout is set. The example
+above is safe only because it uses `Set` and `Get`, neither of which starts a flight.
+
+Once your code under test calls `GetOrSet`, the caller can stop waiting on that flight before it
+finishes: a [soft timeout](/features/timeouts) is one way, and a cancelled caller context is
+another, since the factory keeps running on a context detached from cancellation either way. From
+that point on, a bare `time.Time` closure that the test goroutine keeps mutating races under
+`-race`.
+
+Guard it:
+
+```go
+type testClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *testClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+```
+:::
+
+Note the clock does not reach inside drivers — the memory driver expires against the real wall
+clock. That split is useful: advancing the injected clock makes an entry logically stale while it is
+still physically present, which is the state [grace](/features/grace-periods) needs.
+
+## Asserting on behaviour, not internals
+
+Events let you assert what the cache did without inspecting it:
+
+```go
+func TestUserIsCached(t *testing.T) {
+	var hits, misses int
+	cache, err := gocache.New(
+		gocache.WithL1(memory.New()),
+		gocache.WithEventHook(func(e gocache.Event) {
+			switch e.(type) {
+			case gocache.EventHit:
+				hits++
+			case gocache.EventMiss:
+				misses++
+			}
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cache.Close() }()
+
+	svc := NewService(db, cache)
+	ctx := context.Background()
+
+	if _, err := svc.User(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.User(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+
+	if misses != 1 || hits != 1 {
+		t.Fatalf("expected one miss then one hit, got %d misses and %d hits", misses, hits)
+	}
+}
+```
+
+Counting factory invocations directly works just as well, and is the clearest way to test stampede
+behaviour:
+
+```go
+var calls atomic.Int32
+
+var wg sync.WaitGroup
+for range 50 {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = gocache.GetOrSet(ctx, cache, "hot", func(ctx context.Context) (int, error) {
+			calls.Add(1)
+			time.Sleep(10 * time.Millisecond)
+			return 1, nil
+		})
+	}()
+}
+wg.Wait()
+
+if got := calls.Load(); got != 1 {
+	t.Fatalf("factory ran %d times, want 1", got)
+}
+```
+
+If the hook is counting from several goroutines, guard the counters — the hook runs on whichever
+goroutine performed the operation.
+
+## Testing failure paths
+
+A stub driver that fails on demand is the simplest way to test what your code does when the cache
+misbehaves:
+
+```go
+type failingDriver struct {
+	gocache.Driver
+	err error
+}
+
+func (d failingDriver) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	return d.err
+}
+```
+
+Embed a real driver, override the method you want to break, and assert that your handler still
+serves a response. A cache that is entirely down should degrade to "slow but correct", and this is
+how you prove it.
+
+## Testing against real backends
+
+Unit tests should not need a server. When you do want to verify against real Redis or a real
+database — driver behaviour, dialect SQL, Lua scripts — put those tests behind a build tag:
+
+```go
+//go:build integration
+
+package mypackage
+
+func TestAgainstRealRedis(t *testing.T) {
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		t.Skip("REDIS_ADDR not set")
+	}
+	// ...
+}
+```
+
+Then `go test` stays fast for everyone, and `go test -tags integration` runs the full thing on
+demand. Skip rather than fail when the environment variable is absent, so a developer without the
+infrastructure still gets a green suite.
+
+gocache's own suite is organised this way, and runs its shared driver conformance suite against real
+Postgres, MySQL and Redis behind a build tag.

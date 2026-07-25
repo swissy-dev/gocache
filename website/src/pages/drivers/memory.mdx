@@ -1,0 +1,96 @@
+# Memory driver
+
+An in-process LRU cache with TTL support. Zero dependencies, nanosecond reads, and the natural
+choice for L1.
+
+```go
+import "github.com/swissy-dev/gocache/driver/memory"
+
+cache, err := gocache.New(
+	gocache.WithL1(memory.New(memory.WithMaxEntries(10_000))),
+)
+```
+
+## Options
+
+### WithMaxEntries
+
+```go
+memory.New(memory.WithMaxEntries(50_000))
+```
+
+The number of entries to hold before evicting the least recently used one. Defaults to 10,000.
+
+This counts **entries, not bytes**. Ten thousand small structs and ten thousand rendered HTML pages
+are very different amounts of memory, so size it against what you actually store. If you cache large
+values, either lower it or measure.
+
+A value below 1 is clamped to 1 — a driver that evicts everything it stores would be a silent
+misconfiguration rather than a useful setting.
+
+## Behaviour
+
+**LRU eviction.** Reads count as use, so a hot entry survives even when it is old. When the driver
+is full, the least recently used entry is dropped to make room.
+
+**Lazy expiry.** Expired entries are removed when something touches that key — a `Get`, `Add` or
+`Delete` — not by a background sweeper. LRU eviction is a separate mechanism: when the driver is
+over capacity it drops whatever is at the back of the LRU list, expired or not, rather than seeking
+out expired entries specifically. An expired entry can sit in its slot, unreadable but still
+counted against `WithMaxEntries`, until a touch removes it or eviction happens to reach it.
+
+**Real wall clock.** The driver expires against `time.Now()`, not the cache's injected
+[clock](/concepts/expiry). This is what makes the [testing pattern](/guides/testing) work: advancing
+an injected clock makes an entry logically stale while it remains physically present, which is the
+state grace needs.
+
+**Copies values on write.** The bytes you hand `Set` are copied, so the driver never aliases a slice
+you later reuse. `Get` does not make a second copy on the way out — it returns the stored slice
+itself, so mutating what `Get` returns corrupts the entry. gocache's own core only ever JSON-decodes
+what a driver returns, so this never bites through the public API, but it matters if you use this
+driver directly.
+
+**Close is a no-op.** There is nothing to release.
+
+## Concurrency
+
+Safe for concurrent use, guarded by a single mutex. Note the mutex is exclusive rather than
+read-write, because a read updates LRU order and therefore mutates the structure.
+
+Under extreme read concurrency that mutex is the driver's ceiling. In practice a cache hit is a map
+lookup and a list splice, so contention rarely shows up before other parts of your system do — but
+if you profile a hot path down to this, sharding across several caches by key is the usual answer.
+
+## Memory use
+
+Nothing is bounded except entry count. gocache stores the JSON envelope, so an entry's footprint is
+your value's serialised size plus the envelope overhead plus map and list bookkeeping.
+
+Two things that catch people out:
+
+**Every instance holds its own copy.** Twenty instances with a 10,000-entry L1 is 200,000 entries
+across the fleet, mostly duplicates. That is the intended trade — local reads — but budget for one
+instance's worth, not the whole data set.
+
+**Large values in a two-tier cache are stored twice.** Once in L2, once in every L1 that reads them.
+`WithSkipL1` does not prevent that — it only suppresses the write-through on that call. The next
+read that finds the entry fresh in L2 backfills L1 anyway, unconditionally, with no flag to stop it,
+so `WithSkipL1` defers the copy into L1 rather than preventing it. To keep a value out of L1
+entirely, give it a cache built with only `WithL2`, no `WithL1`.
+
+## As a single-tier cache
+
+For a single process, memory alone is a complete cache:
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(memory.New(memory.WithMaxEntries(10_000))),
+	gocache.WithDefaultTTL(5*time.Minute),
+)
+```
+
+Everything works — [tags](/features/tags), [grace](/features/grace-periods),
+[locks](/features/locks) — scoped to this process. Locks in particular are then only mutual
+exclusion between goroutines, not across your fleet.
+
+Nothing survives a restart. For a cache that is usually correct.

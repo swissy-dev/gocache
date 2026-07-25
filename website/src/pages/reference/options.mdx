@@ -1,0 +1,110 @@
+# Options
+
+Two kinds. `Option` configures the cache at construction; `CallOption` configures a single
+operation and overrides the cache default for that call.
+
+## Constructor options
+
+Passed to `gocache.New`.
+
+### Tiers
+
+| Option | Description |
+|---|---|
+| `WithL1(Driver)` | The local tier, consulted first |
+| `WithL2(Driver)` | The shared tier, authoritative |
+| `WithBus(Bus)` | Cross-instance invalidation; requires both tiers |
+
+At least one tier is required.
+
+### Expiry
+
+| Option | Default | Description |
+|---|---|---|
+| `WithDefaultTTL(d)` | 30 minutes | TTL for entries written without `WithTTL` |
+| `WithDefaultGrace(d)` | off | How long past expiry an entry stays servable on factory failure |
+| `WithTagCacheTTL(d)` | 10 seconds | How long tag markers are cached in L1; zero is rejected |
+
+### Timeouts
+
+| Option | Default | Description |
+|---|---|---|
+| `WithSoftTimeout(d)` | off | Return a stale value after this long, leaving the factory running |
+| `WithHardTimeout(d)` | off | Cancel the factory's context after this long |
+
+Soft timeouts require grace — there must be a stale value to return.
+
+### Behaviour
+
+| Option | Default | Description |
+|---|---|---|
+| `WithCodec(Codec)` | `encoding/json` | Value encoder; must produce valid JSON |
+| `WithClock(func() time.Time)` | `time.Now` | Clock for logical expiry |
+| `WithEventHook(func(Event))` | none | Called synchronously for every event |
+| `WithLogger(*slog.Logger)` | `slog.Default()` | Receives swallowed failures; `nil` silences |
+| `WithBusRetryQueueSize(n)` | 1024 | Bounded queue for failed bus publishes |
+
+### Validation
+
+`New` returns an error rather than deferring failure. It rejects:
+
+- no tier configured
+- a bus without both an L1 and an L2
+- a nil driver, bus, codec or clock
+- a negative duration on any option
+- a zero tag-cache TTL
+- a bus retry queue size below 1
+- a codec whose output is not valid JSON
+
+## Call options
+
+Passed to `Set`, `SetForever`, `GetOrSet` and `GetOrSetForever` — the operations that write. `Get`,
+`Has` and `Pull` take none; see [Operations](/reference/operations) for the exact signatures.
+
+| Option | Description |
+|---|---|
+| `WithTTL(d)` | TTL for this entry; zero means no expiry |
+| `WithTags(tags...)` | Tags to attach, for [tag invalidation](/features/tags) |
+| `WithGrace(d)` | Staleness bound for this call; zero disables grace |
+| `WithCallSoftTimeout(d)` | Soft timeout for this call |
+| `WithCallHardTimeout(d)` | Hard timeout for this call |
+| `WithSkipL1()` | Do not write to the local tier |
+| `WithSkipBus()` | Do not publish an invalidation |
+
+The per-call timeout options are named differently from their constructor counterparts because Go
+does not overload — `WithSoftTimeout` configures the cache, `WithCallSoftTimeout` configures a call.
+
+### Notes on specific options
+
+**`WithTTL`** — a negative duration is clamped to zero, meaning no expiry, rather than being treated
+as already expired.
+
+**`WithGrace`** — a real duration, not a switch. A stale entry is served only while it is within
+this long of its logical expiry. The entry's physical lifetime in the driver was fixed by whatever
+grace was in effect on the call that *wrote* it, not the cache-wide default — so a narrower per-call
+value on a read always tightens the bound, but a wider one only reaches as far as that write-time
+lifetime. Asking for more grace than the entry was written with will not find anything past it.
+
+**`WithTags`** — replaces rather than appends. All tags for an entry go in one call.
+
+## A worked configuration
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(memory.New(memory.WithMaxEntries(50_000))),
+	gocache.WithL2(redisdriver.New(client)),
+	gocache.WithBus(redisbus.New(client)),
+
+	gocache.WithDefaultTTL(5*time.Minute),
+	gocache.WithDefaultGrace(time.Hour),
+	gocache.WithSoftTimeout(150*time.Millisecond),
+	gocache.WithHardTimeout(10*time.Second),
+
+	gocache.WithEventHook(hook),
+	gocache.WithLogger(logger),
+)
+```
+
+Read that as: cache locally and share via Redis; entries are good for five minutes and servable for
+an hour after that if the origin fails; do not make anyone wait longer than 150 ms when there is
+something stale to return; give up on a factory after ten seconds.

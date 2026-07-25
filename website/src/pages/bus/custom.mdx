@@ -1,0 +1,157 @@
+# Writing a bus
+
+Three methods. If you already run NATS, Kafka, or an in-house fan-out, carrying gocache's
+invalidations over it is straightforward.
+
+## The interface
+
+```go
+type Bus interface {
+	Publish(ctx context.Context, msg []byte) error
+	Subscribe(ctx context.Context, handler func(ctx context.Context, msg []byte)) error
+	Close() error
+}
+```
+
+The core hands you opaque bytes and expects them delivered to every live subscriber on every other
+instance. You never need to interpret them.
+
+## The contract
+
+**Deliver to everyone, including the publisher.** Do not try to filter out the sender — gocache
+stamps each message with an origin ID and drops its own. A bus that filters by sender is doing work
+the core already does, and doing it less reliably.
+
+**`Subscribe`'s context bounds the subscription.** The core passes its lifecycle context; when it is
+cancelled, stop delivering. `Close` must also stop delivery.
+
+**Own your goroutine, and join it.** If `Subscribe` starts a reader, `Close` must wait for it. After
+`Close` returns, the handler must not run again — that guarantee is what lets the core close its
+drivers safely.
+
+**`Close` must be idempotent** and must never close a client the caller handed you.
+
+**Reject use after close.** `Subscribe` called after `Close` should return an error rather than
+starting a goroutine nothing will ever join.
+
+## A sketch
+
+```go
+package mybus
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+)
+
+var ErrClosed = errors.New("mybus: bus closed")
+
+type Bus struct {
+	client  *broker.Client
+	subject string
+
+	mu     sync.Mutex
+	closed bool
+	subs   []*broker.Subscription
+	wg     sync.WaitGroup
+	once   sync.Once
+}
+
+func New(client *broker.Client, subject string) *Bus {
+	return &Bus{client: client, subject: subject}
+}
+
+func (b *Bus) Publish(ctx context.Context, msg []byte) error {
+	if err := b.client.Publish(ctx, b.subject, msg); err != nil {
+		return fmt.Errorf("mybus: publish: %w", err)
+	}
+	return nil
+}
+
+func (b *Bus) Subscribe(ctx context.Context, handler func(context.Context, []byte)) error {
+	sub, err := b.client.Subscribe(ctx, b.subject)
+	if err != nil {
+		return fmt.Errorf("mybus: subscribe: %w", err)
+	}
+
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		_ = sub.Close()
+		return ErrClosed
+	}
+	b.subs = append(b.subs, sub)
+	b.wg.Add(1)
+	b.mu.Unlock()
+
+	go func() {
+		defer b.wg.Done()
+		defer func() { _ = sub.Close() }()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case m, ok := <-sub.Messages():
+				if !ok {
+					return
+				}
+				handler(ctx, m.Data)
+			}
+		}
+	}()
+	return nil
+}
+
+func (b *Bus) Close() error {
+	b.once.Do(func() {
+		b.mu.Lock()
+		b.closed = true
+		subs := b.subs
+		b.subs = nil
+		b.mu.Unlock()
+
+		for _, s := range subs {
+			_ = s.Close()
+		}
+		b.wg.Wait()
+	})
+	return nil
+}
+```
+
+Three details in there are load-bearing. `wg.Add(1)` happens inside the same critical section that
+checks `closed` and appends the subscription — outside it, a `Close` running concurrently could wait
+on a counter that has not been incremented yet and return while a goroutine is still starting. `Close`
+closes the subscriptions *before* waiting, so the reader loops actually terminate. And the whole body
+runs inside `sync.Once`: without it, a `Close` that arrives while another is already inside
+`wg.Wait()` would see `closed` already `true` and return immediately — handing that caller a `nil`
+error while handlers are still running, which breaks "after `Close` returns, the handler must not
+run again" for that caller. `Once.Do` blocks every caller until the first one's shutdown, including
+the wait, has actually finished.
+
+## Delivery guarantees
+
+Messages may be dropped. gocache treats the bus as best-effort: a lost invalidation means a peer
+serves a stale entry until its TTL expires, not that anything is corrupted. Building an at-least-once
+bus is fine, but the core does not need one.
+
+Ordering does not matter either, since messages carry invalidations rather than values.
+
+What does matter is not delivering *after* `Close` returns, and not blocking `Publish`
+indefinitely — the core allows five seconds before treating a publish as failed.
+
+## Testing it
+
+Two properties are worth pinning, and both are easy to get wrong:
+
+- **A published message reaches a subscriber on another instance.** Two buses over the same broker,
+  publish on one, assert the other's handler fires.
+- **`Close` joins the delivery goroutine.** Block a handler, call `Close` from another goroutine,
+  assert it does not return until the handler does. A leak check like
+  [goleak](https://github.com/uber-go/goleak) around subscribe-then-close catches the rest.
+
+The second is the one that silently passes for the wrong reason — closing the underlying
+subscription usually makes the goroutine exit quickly enough that a leak checker's retry window
+hides a missing join. Test it with a handler you control.

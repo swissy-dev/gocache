@@ -1,0 +1,141 @@
+# Operations
+
+Data operations are package-level generic functions, because Go methods cannot have type
+parameters. Management operations are methods on `*Cache`.
+
+## Reading and writing
+
+### Get
+
+```go
+func Get[T any](ctx context.Context, c *Cache, key string) (T, bool, error)
+```
+
+Returns the value, whether it was found, and an error. A miss is `(zero, false, nil)` — not an
+error. Never returns a logically stale value.
+
+### Set
+
+```go
+func Set(ctx context.Context, c *Cache, key string, value any, opts ...CallOption) error
+func SetForever(ctx context.Context, c *Cache, key string, value any, opts ...CallOption) error
+```
+
+Writes through L2, then L1, then publishes an invalidation. `SetForever` is `Set` with the TTL
+forced to zero.
+
+If L2 fails, the write returns that error and L1 is left alone. If L1 fails after L2 succeeded, the
+error is returned but the bus publish still happens, because the shared tier really did change.
+
+### GetOrSet
+
+```go
+func GetOrSet[T any](ctx context.Context, c *Cache, key string,
+	factory func(context.Context) (T, error), opts ...CallOption) (T, error)
+
+func GetOrSetForever[T any](ctx context.Context, c *Cache, key string,
+	factory func(context.Context) (T, error), opts ...CallOption) (T, error)
+```
+
+Returns the cached value, or runs the factory and caches the result. Concurrent callers for the same
+key share one factory call. See [Cache-aside and stampedes](/features/get-or-set).
+
+A failed cache write does **not** fail the call — the value is returned with a nil error and
+`EventWriteFailed` is emitted.
+
+### Pull
+
+```go
+func Pull[T any](ctx context.Context, c *Cache, key string) (T, bool, error)
+```
+
+Reads, then deletes.
+
+:::warning[Pull is not atomic]
+It is `Get` followed by `Delete`, with no atomicity between them. Two concurrent callers can both
+receive the same value.
+
+Fine for a one-shot value where a duplicate read is harmless. A value that must be consumed exactly
+once needs a [lock](/features/locks).
+:::
+
+## Management
+
+```go
+func (c *Cache) Has(ctx context.Context, key string) (bool, error)
+func (c *Cache) Delete(ctx context.Context, key string) (bool, error)
+func (c *Cache) DeleteMany(ctx context.Context, keys []string) error
+func (c *Cache) DeleteByTag(ctx context.Context, tags ...string) error
+func (c *Cache) Clear(ctx context.Context) error
+func (c *Cache) Namespace(name string) *Cache
+func (c *Cache) Lock(name string, ttl time.Duration) *Lock
+func (c *Cache) Close() error
+```
+
+`Delete` reports whether a live entry was removed. Deletes are delete-through across both tiers,
+combining independent tier failures.
+
+`Clear` removes every key under the current namespace prefix. On a root cache that prefix is empty —
+see the [warning](/concepts/keys-and-namespaces).
+
+`Namespace` returns a derived cache sharing the parent's drivers, bus and lifecycle.
+
+`Close` is idempotent: the shutdown work happens once and every call returns that same result.
+Afterwards every operation that can return an error returns [`ErrClosed`](/reference/errors).
+
+## Locks
+
+```go
+func (l *Lock) Acquire(ctx context.Context) (bool, error)
+func (l *Lock) Release(ctx context.Context) error
+func (l *Lock) ForceRelease(ctx context.Context) error
+func (l *Lock) Block(ctx context.Context, timeout time.Duration) error
+func (l *Lock) Do(ctx context.Context, fn func(context.Context) error) error
+```
+
+`Do` acquires, runs, and releases — including on panic — and returns `ErrLockHeld` if the lock is
+taken. `Block` waits with jittered backoff and returns `ErrLockTimeout` on expiry. `Release` is a
+no-op when the owner token no longer matches.
+
+See [Atomic locks](/features/locks).
+
+## Interfaces
+
+```go
+type Driver interface {
+	Get(ctx context.Context, key string) (value []byte, found bool, err error)
+	Set(ctx context.Context, key string, value []byte, ttl time.Duration) error
+	Add(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error)
+	Delete(ctx context.Context, key string) (bool, error)
+	DeleteMany(ctx context.Context, keys []string) error
+	DeleteIfEquals(ctx context.Context, key string, value []byte) (bool, error)
+	ClearPrefix(ctx context.Context, prefix string) error
+	Close() error
+}
+
+type Bus interface {
+	Publish(ctx context.Context, msg []byte) error
+	Subscribe(ctx context.Context, handler func(ctx context.Context, msg []byte)) error
+	Close() error
+}
+
+type Codec interface {
+	Marshal(v any) ([]byte, error)
+	Unmarshal(data []byte, v any) error
+}
+```
+
+See [Writing a driver](/drivers/custom) and [Writing a bus](/bus/custom).
+
+## Conventions
+
+Every operation that does I/O takes a `context.Context` first and respects cancellation. Three
+methods don't, because they do none of their own: `Close`, `Namespace`, and `Lock` itself (the
+constructor — `Acquire`, `Release` and the rest of `*Lock`'s methods still take one). `GetOrSet` is
+a partial exception: its factory runs on a context detached from the caller's, so a cancelled caller
+stops waiting on the result without stopping the factory.
+
+When `err != nil`, the returned value is the zero value and must not be used. There are no
+dual-meaning returns.
+
+A cache miss is not an error.

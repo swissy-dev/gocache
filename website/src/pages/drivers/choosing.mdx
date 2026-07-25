@@ -1,0 +1,61 @@
+# Choosing a driver
+
+A driver is a byte store. gocache handles the envelope, tiering, tags, grace and locking; the driver
+only has to get and set bytes with a TTL.
+
+## The four
+
+| Driver | Package | Shared | Survives restart | Use as |
+|---|---|---|---|---|
+| [Memory](/drivers/memory) | `driver/memory` | No | No | L1, or a single-process cache |
+| [Redis](/drivers/redis) | `driver/redisdriver` | Yes | Configurable | L2 |
+| [SQL](/drivers/sql) | `driver/sqldriver` | Yes | Yes | L2 |
+| [Null](/drivers/null) | `driver/null` | — | — | Turning a tier off |
+
+## Deciding
+
+**One process?** Memory alone. There is nothing to share and no invalidation to propagate.
+
+**Several processes, and you already run Redis?** Memory as L1, Redis as L2, Redis Pub/Sub as the
+bus. This is the configuration the library is designed around: local reads, shared truth, immediate
+invalidation.
+
+**Several processes, and you would rather not add Redis?** Memory as L1, SQL as L2. Your database is
+already there, already backed up, already monitored. It is slower than Redis and adds load to the
+system you are usually trying to protect — but for a modest cache it is often the right trade, and
+it removes a dependency.
+
+Without a bus, peers reconcile only when their own L1 entries expire, so keep TTLs short.
+
+**Want caching off in some environment?** Null, in place of whichever tier you are disabling. No
+call sites change.
+
+## Import cost
+
+Only the core package is unavoidable. It depends on the standard library and `golang.org/x/sync`
+and nothing else, so importing gocache does not pull in a Redis client or a database driver — those
+arrive only if you import the corresponding driver package.
+
+## Clients are yours
+
+The Redis driver takes a `redis.UniversalClient`; the SQL driver takes a `*sql.DB`. In both cases
+gocache uses what you hand it and **never closes it**, and never configures it — the SQL driver does
+not touch your connection pool settings.
+
+Close them yourself, after the cache:
+
+```go
+defer client.Close()
+defer func() { _ = cache.Close() }()
+```
+
+Deferred calls run in reverse order, so this closes the cache first and then the client.
+
+## Mixing
+
+Nothing requires memory to be L1 or Redis to be L2. The tiers accept any `Driver`, and the
+distinction is which is consulted first and which is authoritative. Two memory drivers as L1 and L2
+is a legitimate — and useful — test configuration.
+
+If none of the four fits, the interface is small enough to implement in an afternoon. See
+[Writing a driver](/drivers/custom).

@@ -1,0 +1,118 @@
+# Lifecycle
+
+A cache is created once, shared for the life of the process, and closed on shutdown.
+
+## Construction
+
+`New` returns an error rather than panicking or deferring failure to the first read:
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(memory.New()),
+	gocache.WithL2(redisdriver.New(client)),
+	gocache.WithBus(redisbus.New(client)),
+)
+if err != nil {
+	return err
+}
+```
+
+It rejects, at construction:
+
+- no tier configured
+- a bus without both an L1 and an L2
+- a nil driver, bus, codec or clock
+- a negative duration on any option
+- a zero tag-cache TTL, which would cache tag markers forever
+- a non-positive bus retry queue size
+- a codec whose output is not valid JSON
+
+The intent is that a cache which constructs is a cache that works. Misconfiguration surfaces at
+startup, next to the code that caused it, rather than as a puzzling miss six hours later.
+
+`*Cache` is safe for concurrent use. Build one and share it; do not build one per request.
+
+## Shutdown
+
+```go
+defer func() { _ = cache.Close() }()
+```
+
+`Close` does the following, in order:
+
+1. Marks the cache closed, so new operations fail fast.
+2. Cancels the internal lifecycle context.
+3. Waits for the cache's own background goroutines: the bus retry drainer, and every in-flight
+   `GetOrSet` factory, including one still running after a [soft timeout](/features/timeouts) let
+   its caller return early.
+4. Closes the bus, then L2, then L1, joining any errors.
+
+It is idempotent: the shutdown work happens once, and every call — including the first — returns
+that same stored result. In practice that result is nil, because none of the bundled drivers'
+`Close` methods ever fail.
+
+After `Close`, every operation returns [`ErrClosed`](/reference/errors) — reads, writes, deletes,
+tag invalidation and every lock method.
+
+:::warning[Namespaces share the lifecycle]
+`Namespace` returns a view over the same drivers, bus and runtime. Closing a namespace closes the
+root cache and every other namespace derived from it. Close the root, once.
+:::
+
+### What Close does not wait for
+
+`Close` joins the goroutines gocache started. It does **not** join your foreground operations — a
+`Get` or `Set` running in another goroutine can still be inside a driver when `Close` reaches that
+driver.
+
+For the four bundled drivers this is harmless: their `Close` is either a no-op or only stops
+background work. It matters if you [write your own driver](/drivers/custom): `Driver.Close` must
+tolerate a concurrent in-flight call rather than, say, yanking a connection pool out from under it.
+
+The clean pattern is the ordinary one — stop serving traffic, then close the cache:
+
+```go
+srv.Shutdown(ctx)          // no more requests in flight
+_ = cache.Close()          // now nothing can be mid-operation
+client.Close()             // your Redis client, which gocache never closes
+```
+
+Drivers and buses never close the client or `*sql.DB` you handed them. That is yours to close, and
+it should happen after the cache.
+
+## Background goroutines
+
+A fully configured cache runs a small, bounded set:
+
+| Goroutine | Started by | Stopped by |
+|---|---|---|
+| Bus subscriber | `New`, when a bus is configured | The bus's own `Close`, called by the cache's `Close` |
+| Bus retry drainer | `New`, when a bus is configured | `Close` |
+| Background factory | Any `GetOrSet` miss | Completion, hard timeout, or `Close` |
+| SQL sweeper | `sqldriver.New`, unless disabled | The driver's own `Close`, called by the cache's `Close` |
+
+Only the retry drainer and in-flight factories are registered with the *cache's* wait group — those
+are the two `Close` joins directly. The bus subscriber row is redisbus behaviour
+specifically: it runs one goroutine per `Subscribe` call, joined by `redisbus.Close`, not by the
+cache directly; `memorybus` has no subscriber goroutine at all, since it delivers messages
+synchronously inside `Publish`. The SQL sweeper is joined the same indirect way, by
+`sqldriver.Close`. In both cases `Cache.Close` reaches the goroutine only by calling `bus.Close()`
+or `driver.Close()` in turn — so a custom bus or driver that does not join its own goroutines on
+`Close` will outlive the cache's `Close` call.
+
+Each goroutine also recovers from panics: a panicking factory, bus handler, retry drainer or sweeper
+is converted to an error or a log line rather than taking down your process.
+
+The library's own test suite asserts this with `goleak` — after `Close`, no gocache goroutine
+survives.
+
+## Errors and the logger
+
+Two failures are handled asynchronously rather than being returned, because there is no caller left
+to return them to:
+
+- A failed bus publish, which is retried from a bounded queue.
+- A background factory's write, after a soft timeout has already returned a value to the caller.
+
+Both surface through [events](/features/events) and an `*slog.Logger`. The logger defaults to
+`slog.Default()`; `WithLogger(nil)` silences it.

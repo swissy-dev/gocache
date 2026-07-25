@@ -1,0 +1,103 @@
+# Factory timeouts
+
+[Grace periods](/features/grace-periods) handle a factory that fails. Timeouts handle one that is
+merely slow — which, from a user's perspective, is often worse.
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(memory.New()),
+	gocache.WithDefaultGrace(time.Hour),
+	gocache.WithSoftTimeout(100*time.Millisecond),
+	gocache.WithHardTimeout(5*time.Second),
+)
+```
+
+Both are off by default.
+
+## Soft timeout
+
+Past the soft timeout, a waiting caller stops waiting and gets the stale copy immediately. The
+factory is **not** cancelled — it keeps running in the background and stores its result when it
+finishes, so the next caller gets a fresh value.
+
+```
+t=0ms     GetOrSet, entry is stale, factory starts
+t=100ms   soft timeout fires  ──▶  caller returns the stale value
+t=2400ms  factory finishes    ──▶  result written to the cache
+```
+
+This is the option that keeps p99 latency flat when a dependency degrades. Your users get a slightly
+old answer in 100 ms instead of a correct one in 2.4 seconds, and the cache refreshes itself without
+anyone waiting on it.
+
+:::info[Soft timeouts need grace]
+The soft timeout arm only engages when there is a stale entry to serve — which means grace must be
+configured and the entry must be within its window. On a cold cache, or with grace off, there is
+nothing to return early and the caller waits for the factory.
+:::
+
+## Hard timeout
+
+The hard timeout cancels the factory's context outright:
+
+```go
+gocache.WithHardTimeout(5 * time.Second)
+```
+
+Your factory should respect its context; if it does, the call fails with a deadline error at the
+limit — unless grace is configured and a stale copy is available within its window, in which case
+the timeout is just another factory failure that grace catches: `GetOrSet` returns the stale value
+with a nil error instead (see [Grace periods](/features/grace-periods)). The configuration at the
+top of this page has grace on, so there a hard timeout more often surfaces as a grace hit than as a
+returned error. Either way, the timeout bounds how long a stuck factory can hold a flight open,
+which matters because everyone else waiting on that key is blocked behind it.
+
+If the factory ignores its context, cancellation is advisory — the goroutine keeps running and
+`Close` will wait for it.
+
+## Using them together
+
+The two compose into a good default for anything backed by a network call:
+
+```go
+gocache.WithSoftTimeout(100*time.Millisecond)   // don't make users wait
+gocache.WithHardTimeout(10*time.Second)         // don't let work run forever
+gocache.WithDefaultGrace(time.Hour)             // give the soft timeout something to serve
+```
+
+Read that as: answer within 100 ms if there is anything to answer with, refresh in the background,
+and give up entirely after ten seconds.
+
+## Per call
+
+Both have per-call forms:
+
+```go
+report, err := gocache.GetOrSet(ctx, cache, "report:annual", buildReport,
+	gocache.WithCallSoftTimeout(0),          // this one is worth waiting for
+	gocache.WithCallHardTimeout(2*time.Minute))
+```
+
+The names differ from the constructor options because Go does not overload — `WithSoftTimeout`
+configures the cache, `WithCallSoftTimeout` configures one call.
+
+## Choosing values
+
+**Soft timeout** should be a little above the normal latency of the factory. Set it at your p50 and
+you will serve stale data half the time; set it at your p95 and it engages only when something is
+genuinely wrong.
+
+**Hard timeout** should be above the worst legitimate duration of the work. It is a backstop against
+a hung dependency, not a latency control — that is the soft timeout's job.
+
+Neither replaces a deadline on the caller's own context. If your HTTP handler has a two-second
+budget, put that on `ctx` and let the caller's cancellation cut its own wait short.
+
+## Interaction with Close
+
+A background factory left running by a soft timeout is tracked by the cache. `Close` waits for it —
+so a shutdown can block for as long as that factory takes, bounded by the hard timeout if you set
+one. If it finishes after `Close`, its write is discarded and reported as `EventWriteFailed`.
+
+This is one of the better reasons to configure a hard timeout in a service that needs to shut down
+promptly.

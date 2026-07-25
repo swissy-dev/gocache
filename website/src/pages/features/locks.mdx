@@ -1,0 +1,149 @@
+# Atomic locks
+
+[Stampede protection](/features/get-or-set) prevents duplicate work *within* one process. Locks
+prevent it across the fleet.
+
+```go
+err := cache.Lock("reports:rebuild", 10*time.Minute).Do(ctx, func(ctx context.Context) error {
+	return rebuildReports(ctx)
+})
+if errors.Is(err, gocache.ErrLockHeld) {
+	// another instance is already doing it
+}
+```
+
+Ten instances run that; one rebuilds.
+
+## Do
+
+`Do` is the safe form and should be your default. It acquires, runs your callback, and releases —
+including when the callback panics, in which case the lock is freed and the panic continues to
+propagate. It also releases when the caller's context has been cancelled, so a cancelled request
+does not strand a lock until its TTL.
+
+If the lock is already held, `Do` returns `ErrLockHeld` without running the callback.
+
+## The TTL
+
+Every lock takes one, as a required parameter:
+
+```go
+cache.Lock("reports:rebuild", 10*time.Minute)
+```
+
+The TTL is the deadlock ceiling. If the holder crashes, is OOM-killed, or loses the network, the
+lock frees itself when the TTL expires — otherwise a dead process would block the work forever.
+
+:::danger[A zero or negative TTL never expires]
+The parameter is required but not validated. `Lock("job", 0)` and a negative duration both produce a
+lock with no expiry at all — the driver only sets one when the TTL is greater than zero. Acquire one
+and let the holder crash, and every later `Acquire` returns `false` forever: the exact deadlock this
+section exists to prevent. Pass a real, positive TTL.
+:::
+
+Set it comfortably longer than the work takes. Too short and a slow run loses its lock while still
+working; too long and a crash blocks everyone for that long. If the job normally takes two minutes,
+ten is a reasonable ceiling.
+
+:::warning[A lock does not extend itself]
+There is no heartbeat or renewal. When the TTL expires the lock is free, whether or not your
+callback is still running — at which point another instance can start the same work concurrently.
+
+Size the TTL against your worst case, not your average.
+:::
+
+## Owner tokens
+
+Each `Lock` value carries a random 16-byte token, and `Release` deletes the lock only if the stored
+token still matches.
+
+That closes a race that bites naive implementations. Your TTL lapses while you are still working;
+another instance acquires the lock; you finish and call `Release`. Without a token you would delete
+*their* lock and a third instance would start immediately, giving you two concurrent runs. With one,
+your release is a no-op — it logs and moves on, and the new holder keeps its lock.
+
+The lock name is namespaced, so `cache.Namespace("users").Lock("rebuild", ttl)` and
+`cache.Lock("rebuild", ttl)` are different locks.
+
+## Manual control
+
+When `Do` does not fit:
+
+```go
+lock := cache.Lock("reports:rebuild", 10*time.Minute)
+
+ok, err := lock.Acquire(ctx)
+if err != nil {
+	return err
+}
+if !ok {
+	return nil   // someone else has it
+}
+defer func() { _ = lock.Release(context.WithoutCancel(ctx)) }()
+
+return rebuildReports(ctx)
+```
+
+`Acquire` reports whether it got the lock; it does not block. To wait for it:
+
+```go
+if err := lock.Block(ctx, 30*time.Second); err != nil {
+	if errors.Is(err, gocache.ErrLockTimeout) {
+		return fmt.Errorf("could not get the lock in 30s")
+	}
+	return err
+}
+defer func() { _ = lock.Release(context.WithoutCancel(ctx)) }()
+```
+
+`Block` retries with jittered backoff until it acquires the lock, the caller's context is cancelled,
+or the timeout elapses.
+
+`ForceRelease` deletes the lock regardless of who owns it. It exists for operational recovery — a
+stuck lock you need to clear by hand — and is not something to reach for in normal flow.
+
+Reuse the same `*Lock` value for the acquire/release pair. Calling `cache.Lock(...)` again mints a
+new token, and releasing with it will not match.
+
+## Where locks live
+
+Locks are stored on the authoritative tier — L2 when configured, otherwise the only tier. They
+bypass L1, the envelope, tags and the bus entirely: a lock is a raw key, not a cache entry.
+
+This means a lock is only as distributed as the tier holding it. A memory-only cache gives you a
+lock scoped to one process, which is still useful for coordinating goroutines but is not fleet-wide
+mutual exclusion.
+
+:::danger[Locks on a null-backed cache never exclude]
+The [null driver](/drivers/null) stores nothing, so its set-if-absent always succeeds and every
+`Acquire` returns true. A cache whose authoritative tier is `null` provides no mutual exclusion at
+all. Disabling caching in a test is fine; disabling it somewhere that relies on locks is not.
+:::
+
+Note also that `Clear` on a root cache removes lock keys along with everything else, releasing any
+held locks. Another reason to [clear a namespace instead](/concepts/keys-and-namespaces).
+
+## What this is and is not
+
+This is a *lease*: mutual exclusion for a bounded window, on a best-effort store. It is the right
+tool for "only one instance should rebuild this", "don't run this cron job twice", "serialise these
+writes".
+
+It is not a consensus system. If two instances holding the same lock simultaneously would corrupt
+data or take money, you need a transactional guarantee from the system of record — a database
+transaction, a conditional write — not a cache lock.
+
+## Locks and GetOrSet
+
+They compose when one fleet-wide computation is genuinely required:
+
+```go
+err := cache.Lock("index:rebuild", 30*time.Minute).Do(ctx, func(ctx context.Context) error {
+	_, err := gocache.GetOrSet(ctx, cache, "index", buildIndex)
+	return err
+})
+```
+
+Most of the time you do not need this. `GetOrSet` alone collapses a stampede to one call per
+instance, and N calls across N instances is usually acceptable. Reach for the lock when it is not —
+when the work is expensive enough that doing it ten times would hurt.

@@ -1,0 +1,122 @@
+# Tags
+
+Tag entries as you write them, then invalidate the whole group in one call:
+
+```go
+err := gocache.Set(ctx, cache, "user:42", user, gocache.WithTags("users", "team:7"))
+err = gocache.Set(ctx, cache, "user:43", other, gocache.WithTags("users"))
+
+err = cache.DeleteByTag(ctx, "users")   // both are now misses
+```
+
+This is the answer to the invalidation problem that otherwise forces you to track keys by hand: when
+a team is renamed, you want every cached thing belonging to that team gone, and you do not want to
+maintain a list of which keys those were.
+
+## How it works
+
+There is no tag-to-keys index. gocache uses tag *versions*.
+
+Each entry's envelope carries its creation timestamp and its tags. `DeleteByTag` writes the current
+timestamp to a single marker key for that tag. On read, an entry carrying a tag is compared against
+that tag's marker: if the entry was created at or before the invalidation, it is treated as a miss.
+
+Three consequences follow, and they are the reason to prefer this design:
+
+**Invalidation is O(1).** One write per tag, whether the tag covers ten keys or ten million. There
+is no set to enumerate and no batch of deletes to issue.
+
+**There is no index to corrupt.** No secondary structure can drift out of sync with the data, which
+is the usual failure mode of tag-to-keys implementations.
+
+**Invalidated entries are not deleted.** They fail the freshness check and are eventually evicted or
+expired by the driver. Invalidation reclaims no space; it only stops entries being served.
+
+## Multiple tags
+
+An entry can carry several. Invalidating *any* of them invalidates the entry:
+
+```go
+err := gocache.Set(ctx, cache, "user:42", user,
+	gocache.WithTags("users", "team:7", "tenant:acme"))
+```
+
+Any of `DeleteByTag(ctx, "users")`, `DeleteByTag(ctx, "team:7")` or `DeleteByTag(ctx, "tenant:acme")`
+makes it a miss. Reading a tagged entry costs one marker lookup per tag, per envelope gocache
+examines — so keep the list short, three or four, not thirty. Untagged entries pay nothing. A read
+that finds a logically stale L1 copy and falls through to L2 examines two envelopes, so it pays that
+cost twice; the second round is normally cheap, since the first round just refreshed the marker in
+the L1 marker cache.
+
+`DeleteByTag` is variadic:
+
+```go
+err := cache.DeleteByTag(ctx, "users", "teams", "permissions")
+```
+
+## Tags are global
+
+Tag markers are not namespaced, so one tag reaches across namespaces:
+
+```go
+err := gocache.Set(ctx, cache.Namespace("users"), "42", user, gocache.WithTags("tenant:7"))
+err = gocache.Set(ctx, cache.Namespace("orders"), "99", order, gocache.WithTags("tenant:7"))
+
+err = cache.DeleteByTag(ctx, "tenant:7")   // both go
+```
+
+That is the point of tags: they express relationships that cut across how you happen to have laid
+out your keys. A tenant's data lives in a dozen namespaces; one tag covers all of it.
+
+## Timing
+
+An entry created *after* an invalidation survives it. An entry created in the same millisecond as
+the invalidation does not — the comparison is inclusive, so a write racing an invalidation loses.
+That is the safe direction: better to discard a fresh entry than serve one that should have been
+invalidated.
+
+## Tag markers are cached
+
+A tag lookup on every read of every tagged entry would be a network round trip you cannot afford.
+gocache caches tag markers in L1 for a short window — 10 seconds by default,
+`WithTagCacheTTL` to change it.
+
+With a bus configured, invalidation propagates immediately: `DeleteByTag` publishes, and every peer
+drops its cached marker. The short TTL is the backstop for when the bus is unavailable, bounding how
+long a peer can serve entries a tag has already invalidated.
+
+Raising the TTL cuts marker lookups and widens that window; lowering it does the reverse. Zero is
+rejected at construction, because it would mean caching markers forever.
+
+This all describes a cache with both tiers: L1 is holding a time-boxed copy of a marker whose real
+authority is L2. On an L1-only cache there is nothing to cache a copy *of* — the marker `DeleteByTag`
+writes is the only copy there is, and it is written with no expiry of its own. It goes away the same
+way any other no-TTL entry does: an explicit delete, a `Clear`, or LRU eviction under capacity
+pressure — not after `WithTagCacheTTL`'s window. Don't conclude an invalidation on an L1-only cache
+is forgotten after 10 seconds; there, it was never on a timer to begin with.
+
+## Naming
+
+Tags are opaque strings; gocache does not interpret them. A structured convention pays off:
+
+```go
+"users"           // an entity type
+"user:42"         // a specific entity
+"tenant:acme"     // an owner
+"team:7:members"  // a relationship
+```
+
+Tag as broadly as you can stand to invalidate. A tag nothing ever invalidates costs a lookup on
+every read and buys nothing; a tag that invalidates half the cache is a blunt instrument.
+
+## What tags do not do
+
+They do not free memory — invalidated entries linger until they expire or are evicted.
+
+They do not enumerate. You cannot ask "which keys carry this tag?"; that is the price of not
+maintaining an index.
+
+They do not version your data. Two entries written in the same millisecond are indistinguishable to
+a tag — `CreatedAt` and the invalidation marker are both millisecond-resolution timestamps. If you
+need "invalidate everything older than this specific write" at finer resolution than that, encode a
+version in the key instead.

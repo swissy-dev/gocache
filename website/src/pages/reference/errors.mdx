@@ -1,0 +1,129 @@
+# Errors
+
+## The invariant
+
+**When `err != nil`, the returned value is the zero value and must not be used.**
+
+There are no dual-meaning returns anywhere in gocache — no "here is a partial result and also an
+error". If you get an error, you got nothing.
+
+## A miss is not an error
+
+```go
+user, found, err := gocache.Get[User](ctx, cache, "user:42")
+if err != nil {
+	return err        // something actually broke
+}
+if !found {
+	// perfectly normal
+}
+```
+
+Reads report absence through a boolean. An error means the cache itself failed — an unreachable
+tier, a decode failure — not that the key was missing.
+
+## Sentinels
+
+| Error | Meaning |
+|---|---|
+| `ErrClosed` | The cache has been closed |
+| `ErrLockHeld` | `Lock.Do` found the lock already taken |
+| `ErrLockTimeout` | `Lock.Block` gave up waiting |
+
+Match them with `errors.Is`:
+
+```go
+if errors.Is(err, gocache.ErrLockHeld) {
+	return nil   // someone else is doing the work
+}
+```
+
+Most errors are wrapped with `%w`, so `errors.Is` and `errors.As` work through the layers —
+`context.Canceled` and `context.DeadlineExceeded` reach you unchanged, and a factory's returned
+error is recoverable from a `GetOrSet` failure. A recovered factory **panic** is the exception worth
+knowing: it is formatted with `%v`, not `%w`, so an `error` panic value cannot be found with
+`errors.Is` or `errors.As` afterward — only its text survives.
+
+Only gocache's own sentinels are a stable API. Driver errors are wrapped for debuggability, but
+matching on a driver's internal error types is not supported and may break when you swap drivers.
+
+## Failures gocache does not return
+
+Four cases are not surfaced to the caller, by design. Only one of them, the bus-publish retry,
+actually happens in the background — the other three are resolved inline, before the call returns.
+All four are reported through [events](/features/events) and a logger instead:
+
+**A grace hit.** When [grace](/features/grace-periods) is configured and a factory fails,
+`GetOrSet` returns the stale value with a nil error. You configured grace, so serving stale is the
+success you asked for. `EventGraceHit` carries the underlying error.
+
+**A failed bus publish.** Retried from a bounded queue in the background. `EventBusPublishFailed`.
+
+:::warning[A failed cache write in GetOrSet]
+If the factory succeeds but the result cannot be cached, `GetOrSet` returns the value with a **nil
+error**. You asked for a value and gocache has one; caching was best-effort.
+
+`EventWriteFailed` is the only signal in the **return value** — the call still succeeds, though the
+same failure is also logged at Warn. It matters regardless: a cache whose writes are all failing
+runs every factory on every call while looking healthy, and nothing about the return value will tell
+you. Plain `Set` does return this error; `GetOrSet` does not.
+:::
+
+**A failed lock release in `Do`.** Logged, with no event. The lock frees itself at its TTL.
+
+Everything else is returned.
+
+## Errors from operations
+
+**`Get`** — `(zero, false, err)` when a tier is unreachable or a value cannot be decoded.
+
+**`Set`** — returns tier failures. L2 failing aborts the write; L1 failing after L2 succeeded still
+returns an error, but the bus publish happens anyway.
+
+**`GetOrSet`** — returns the wrapped factory error when the factory fails and grace does not cover
+it. A panicking factory becomes an error too, delivered to every waiting caller.
+
+**`Delete`, `DeleteMany`, `Clear`** — independent tier failures are combined, so a single error can
+describe both tiers.
+
+**`DeleteByTag`** — narrower: it writes only the authoritative tier (L2 when configured, otherwise
+L1) and joins the per-*tag* errors from that write. The best-effort copy it keeps in L1's tag cache
+is not part of the returned error — if that write fails, it is logged, not returned.
+
+**Lock methods** — return driver errors wrapped. `Release` returns nil when the owner token no
+longer matches, since that is a legitimate outcome rather than a failure.
+
+## After Close
+
+Every operation returns `ErrClosed` — reads, writes, deletes, tag invalidation and every lock
+method:
+
+```go
+_ = cache.Close()
+
+if _, _, err := gocache.Get[User](ctx, cache, "user:42"); errors.Is(err, gocache.ErrClosed) {
+	// expected
+}
+```
+
+`Close` itself is idempotent: the shutdown work runs once, and every call — first or later — returns
+whatever that one run produced. In practice that is nil, since none of the shipped drivers' `Close`
+methods fail.
+
+## Handling them
+
+Most of the time a cache error should not fail the request. The cache exists to make things faster;
+when it breaks, correct-but-slow is a better outcome than an error page:
+
+```go
+user, err := gocache.GetOrSet(ctx, cache, key, loadUser)
+if err != nil {
+	slog.Warn("cache unavailable", "err", err)
+	return loadUser(ctx)   // go straight to the source
+}
+return user, nil
+```
+
+Two exceptions. A decode error means what is cached does not match what your code expects — usually
+a struct changed without the keys changing — and falling back silently hides it. And an `ErrClosed`
+during shutdown is expected, not worth logging.

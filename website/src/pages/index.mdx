@@ -1,0 +1,106 @@
+# Getting started
+
+gocache is a multi-tier cache for Go. An in-memory L1 sits in front of a shared L2 — Redis or your
+SQL database — and a message bus keeps every instance's L1 honest when data changes.
+
+The shape you'll write most often:
+
+```go
+user, err := gocache.GetOrSet(ctx, cache, "user:42", func(ctx context.Context) (User, error) {
+	return db.FindUser(ctx, 42)
+}, gocache.WithTags("users"))
+```
+
+One database call per instance, no matter how many goroutines ask at once. Served from process
+memory on the way back. Invalidated everywhere with `cache.DeleteByTag(ctx, "users")`.
+
+## Requirements
+
+Go 1.25 or later.
+
+## Installation
+
+```bash
+go get github.com/swissy-dev/gocache
+```
+
+The core package depends only on the standard library and `golang.org/x/sync`. Redis and SQL support
+live in separate packages, so importing gocache does not pull a Redis client into your build.
+
+## Your first cache
+
+Start with memory only. No infrastructure, no configuration to get wrong:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/swissy-dev/gocache"
+	"github.com/swissy-dev/gocache/driver/memory"
+)
+
+type Article struct {
+	ID    int    `json:"id"`
+	Title string `json:"title"`
+}
+
+func main() {
+	cache, err := gocache.New(
+		gocache.WithL1(memory.New(memory.WithMaxEntries(10_000))),
+		gocache.WithDefaultTTL(5*time.Minute),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = cache.Close() }()
+
+	ctx := context.Background()
+
+	article, err := gocache.GetOrSet(ctx, cache, "article:1", func(ctx context.Context) (Article, error) {
+		return loadArticle(ctx, 1)
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println(article.Title)
+}
+```
+
+`New` validates everything up front. A cache with no tier, a nil driver, a negative duration, a bus
+without both tiers — all of them fail here rather than surprising you at runtime.
+
+`Close` stops the cache's background goroutines and closes the bus and drivers. It is safe to call
+more than once, and every operation returns [`ErrClosed`](/reference/errors) afterwards.
+
+## Adding a shared tier
+
+One process caching in its own memory is useful. Several processes sharing a cache is where the
+design earns its keep. Add an L2 and a bus:
+
+```go
+client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+
+cache, err := gocache.New(
+	gocache.WithL1(memory.New(memory.WithMaxEntries(10_000))),
+	gocache.WithL2(redisdriver.New(client)),
+	gocache.WithBus(redisbus.New(client)),
+	gocache.WithDefaultTTL(30*time.Minute),
+)
+```
+
+Reads are served from local memory. Writes go to Redis, then to local memory, then tell every peer
+to drop its copy. See [Running multiple instances](/guides/running-multiple-instances) for what the
+bus does and what happens when it is unavailable.
+
+## Where to go next
+
+- [How it works](/introduction/how-it-works) — the model behind the API, in five minutes.
+- [Caching database queries](/guides/caching-database-queries) — the pattern you came here for.
+- [Cache-aside and stampedes](/features/get-or-set) — why `GetOrSet` exists and what it guarantees.
+- [Choosing a driver](/drivers/choosing) — memory, Redis, SQL, or none.

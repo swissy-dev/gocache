@@ -1,0 +1,109 @@
+# How it works
+
+Five minutes here will save you an afternoon later. Everything gocache does follows from three
+ideas: two tiers, an envelope, and a bus.
+
+## Two tiers
+
+**L1** is process-local memory. It is the fastest thing available to you — reads cost microseconds,
+not a network round trip — but every instance of your application has its own — they know nothing
+about each other.
+
+**L2** is shared: Redis, or a table in your SQL database. Slower than memory, but it is the same
+data for everyone, which makes it the authority.
+
+You can run either alone. A single-process program with no shared state needs only L1. A fleet that
+would rather not hold anything in memory can run only L2. Most deployments run both, which is where
+the tiering pays off: reads land in memory, and the shared tier is consulted only when memory
+doesn't have a fresh answer.
+
+### Reading
+
+A read walks the tiers in order:
+
+1. Check L1. If the entry is there and still logically fresh, return it. Done — no network.
+2. Otherwise check L2. If L2 has a fresh entry, copy it into L1 on the way past (so the next read
+   in this process is local) and return it.
+3. Otherwise it's a miss.
+
+L2 is authoritative, which has one consequence worth internalising: if L1 holds a stale entry and
+L2 has nothing, the result is a miss. gocache does not fall back to a stale local copy just because
+the shared tier has moved on.
+
+### Writing
+
+A write goes the other way — shared tier first:
+
+1. Write to L2.
+2. Write to L1.
+3. Publish an invalidation on the bus.
+
+Ordering matters, for two separate reasons. If the L2 write fails, gocache returns immediately
+without touching L1 — this process can never end up caching a value the authoritative tier just
+rejected. And the bus publish happens last: by the time a peer is told to drop its copy and goes
+back to L2, the new value is already there waiting for it.
+
+## The envelope
+
+gocache does not store your value directly. It wraps it in an envelope carrying the value, when it
+was created, when it logically expires, and any tags:
+
+```json
+{ "v": { "id": 42, "name": "Ada" }, "c": 1690000000000, "x": 1690000060000, "t": ["users"] }
+```
+
+That envelope is what makes tags, grace periods and the freshness rules possible. Freshness is
+self-contained — comparing `x` against the clock answers "is this still good?" using only the
+envelope itself. Tag validity is not: confirming a tag hasn't been invalidated costs one marker
+lookup per tag, which is why those markers are themselves cached (see [Tags](/features/tags)).
+
+It also explains a constraint: your value is embedded in a JSON document, so a custom
+[codec](/concepts/serialization) must produce valid JSON.
+
+## Logical versus physical expiry
+
+An entry has two lifetimes, and keeping them straight explains most of gocache's behaviour.
+
+**Logical expiry** is the TTL you asked for. It decides whether a read is a hit.
+
+**Physical lifetime** is how long the entry actually occupies the store. When you configure a
+[grace period](/features/grace-periods), gocache deliberately keeps the entry in the store for
+longer than its TTL — logical TTL plus grace — so that a stale copy is still there to fall back on
+if the source of truth fails.
+
+Without grace configured, the two are the same and an expired entry simply goes away.
+
+## The bus
+
+Here is the problem the bus solves. Two instances, both caching `user:42` in memory. Instance A
+updates it and writes to Redis. Instance B never finds out, and keeps serving its own stale copy
+from memory until the TTL runs out.
+
+The bus is how A tells B. On every write, delete, clear or tag invalidation, the acting instance
+publishes a small message; every peer receives it and **drops what the message names** from its own
+L1 — the affected keys, a prefix for a `Clear`, or its cached copy of that tag's marker for a tag
+invalidation. It never touches L2 — the shared tier is already correct — and it never carries
+values, only invalidations. Each instance tags its messages with a random origin ID and ignores its
+own.
+
+Because a bus exists to reconcile L1 against L2, it is only meaningful when you have both, and
+gocache rejects the configuration at construction if you don't.
+
+If the bus is down, nothing fails: publishes go to a bounded retry queue, and peers keep serving
+their own copies until those expire on their own. Staleness stays bounded by your TTL rather than
+becoming unbounded.
+
+## Putting it together
+
+A `GetOrSet` on a cold two-tier cache with a bus does this:
+
+1. Miss in L1, miss in L2.
+2. Take a per-key flight so that concurrent callers for the same key share one factory call.
+3. Run your factory.
+4. Wrap the result in an envelope, write it to L2, then L1.
+5. Publish an invalidation so peers drop whatever they had.
+6. Return the value to every caller that was waiting.
+
+Every feature in the rest of these docs — [stampede protection](/features/get-or-set),
+[tags](/features/tags), [grace](/features/grace-periods), [timeouts](/features/timeouts),
+[locks](/features/locks) — is a variation on those steps.

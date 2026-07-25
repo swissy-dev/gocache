@@ -1,0 +1,98 @@
+# Expiry
+
+Every entry has a TTL. The default is 30 minutes; override it globally or per call:
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(memory.New()),
+	gocache.WithDefaultTTL(5*time.Minute),
+)
+
+err = gocache.Set(ctx, cache, "user:42", user, gocache.WithTTL(time.Minute))
+```
+
+## Entries that never expire
+
+A TTL of zero means no expiry:
+
+```go
+err := gocache.SetForever(ctx, cache, "config", cfg)
+value, err := gocache.GetOrSetForever(ctx, cache, "config", loadConfig)
+```
+
+`SetForever` and `GetOrSetForever` are `Set` and `GetOrSet` with the TTL forced to zero. A negative
+TTL is clamped to zero and behaves the same way, rather than being treated as "already expired".
+
+An entry with no expiry stays in the store until something deletes it: an explicit `Delete`, a
+`Clear`, or eviction by the driver — the memory driver's LRU will still evict it under capacity
+pressure. A tag invalidation does not delete it; it only stops it being served (see
+[Tags](/features/tags)), so a no-expiry entry that a tag has invalidated can sit in the store,
+unservable, indefinitely.
+
+## Logical versus physical expiry
+
+This distinction explains most of gocache's behaviour, and it is worth understanding before you
+configure [grace periods](/features/grace-periods).
+
+**Logical expiry** lives in the envelope: the timestamp gocache compares against to decide whether a
+read is a hit. This is the TTL you asked for.
+
+**Physical lifetime** is the TTL gocache hands the driver — how long the bytes actually occupy the
+store.
+
+Without grace, the two are identical. With grace configured, the physical lifetime is deliberately
+longer:
+
+```
+physical TTL = remaining logical TTL + grace
+```
+
+The entry outlives its own freshness on purpose, so a stale copy is still sitting there if the
+source of truth later fails and you need something to fall back on. `Get` will not return it — it
+compares against the *logical* expiry — but `GetOrSet` can, under the rules described in
+[Grace periods](/features/grace-periods).
+
+An entry with no expiry has no physical bound either; grace does not apply to it, because it never
+becomes stale.
+
+## The clock
+
+Expiry is evaluated against a clock you can replace:
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(memory.New()),
+	gocache.WithClock(func() time.Time { return fixedTime }),
+)
+```
+
+This governs *logical* expiry — envelope timestamps, tag comparisons, grace windows. It does not
+reach inside a driver: the memory driver expires its own entries against the real wall clock, and
+Redis and SQL against theirs.
+
+That split is deliberate and useful in tests: advancing an injected clock makes an entry logically
+stale while it is still physically present, which is exactly the state grace needs. See
+[Testing](/guides/testing) for how to drive it, including the concurrency caveat.
+
+## Backfill and TTL
+
+When a read is served from L2 and copied into L1, the backfilled entry keeps the *remaining* logical
+TTL of the original. An entry written with a 10-minute TTL and read from L2 after 9 minutes lands in
+L1 with one minute left, not ten. Backfill extends locality, not lifetime.
+
+Backfill computes its physical lifetime using the cache-wide grace setting, not any per-call grace
+you passed to the read.
+
+## Expiry is not eviction
+
+Two different things remove entries, and it helps to keep them separate:
+
+**Expiry** is time-based and is what this page describes.
+
+**Eviction** is capacity-based and belongs to the driver. The memory driver holds a bounded number
+of entries (`WithMaxEntries`, default 10,000) and drops the least recently used one when full — a
+key can vanish long before its TTL. Redis evicts according to your server's `maxmemory-policy`. The
+SQL driver does not evict at all; it grows until its sweeper removes expired rows.
+
+A cache read can therefore miss for reasons that have nothing to do with your TTL. Always treat a
+miss as normal, and never assume an entry you wrote a moment ago is still there.
