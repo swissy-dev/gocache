@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/rand/v2"
+	"sync"
 	"time"
 )
 
@@ -13,18 +14,36 @@ type Lock struct {
 	cache *Cache
 	key   string
 	ttl   time.Duration
+	mu    sync.Mutex
 	token []byte
 }
 
 func (c *Cache) Lock(name string, ttl time.Duration) *Lock {
-	b := make([]byte, 16)
-	crand.Read(b)
 	return &Lock{
 		cache: c,
 		key:   c.lockKey(name),
 		ttl:   ttl,
-		token: []byte(hex.EncodeToString(b)),
 	}
+}
+
+func newLockToken() []byte {
+	b := make([]byte, 16)
+	crand.Read(b)
+	return []byte(hex.EncodeToString(b))
+}
+
+func (l *Lock) hold(token []byte) {
+	l.mu.Lock()
+	l.token = token
+	l.mu.Unlock()
+}
+
+func (l *Lock) retire() []byte {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	token := l.token
+	l.token = nil
+	return token
 }
 
 func (l *Lock) Acquire(ctx context.Context) (bool, error) {
@@ -34,11 +53,13 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	if l.ttl <= 0 {
 		return false, ErrLockTTL
 	}
-	ok, err := l.cache.authoritative().Add(ctx, l.key, l.token, l.ttl)
+	token := newLockToken()
+	ok, err := l.cache.authoritative().Add(ctx, l.key, token, l.ttl)
 	if err != nil {
 		return false, fmt.Errorf("gocache: lock acquire: %w", err)
 	}
 	if ok {
+		l.hold(token)
 		l.cache.emit(EventLockAcquired{Key: l.key})
 	}
 	return ok, nil
@@ -48,7 +69,11 @@ func (l *Lock) Release(ctx context.Context) error {
 	if l.cache.rt.closed.Load() {
 		return ErrClosed
 	}
-	ok, err := l.cache.authoritative().DeleteIfEquals(ctx, l.key, l.token)
+	token := l.retire()
+	if token == nil {
+		return nil
+	}
+	ok, err := l.cache.authoritative().DeleteIfEquals(ctx, l.key, token)
 	if err != nil {
 		return fmt.Errorf("gocache: lock release: %w", err)
 	}
@@ -64,6 +89,7 @@ func (l *Lock) ForceRelease(ctx context.Context) error {
 	if l.cache.rt.closed.Load() {
 		return ErrClosed
 	}
+	l.retire()
 	if _, err := l.cache.authoritative().Delete(ctx, l.key); err != nil {
 		return fmt.Errorf("gocache: lock force release: %w", err)
 	}

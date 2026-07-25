@@ -51,13 +51,26 @@ Size the TTL against your worst case, not your average.
 
 ## Owner tokens
 
-Each `Lock` value carries a random 16-byte token, and `Release` deletes the lock only if the stored
-token still matches.
+Every successful `Acquire` mints a fresh random 16-byte token and stores it with the lock. `Release`
+consumes that token — it takes it, forgets it locally, and deletes the lock only if the stored token
+still matches.
 
 That closes a race that bites naive implementations. Your TTL lapses while you are still working;
 another instance acquires the lock; you finish and call `Release`. Without a token you would delete
 *their* lock and a third instance would start immediately, giving you two concurrent runs. With one,
 your release is a no-op — it logs and moves on, and the new holder keeps its lock.
+
+Minting per acquire rather than once per `*Lock` value is what makes that hold over a lock's whole
+life: a token belongs to one lease, not to a Go value that may take many. Once a lease ends its token
+is retired and can never match again, so a second `Release`, or a `Release` after `ForceRelease`,
+cannot reach a lease somebody took in the meantime. Releasing when nothing is held does nothing at
+all and returns nil.
+
+:::warning[One `*Lock` value holds one lease]
+A `*Lock` value remembers a single token, so do not share one value between goroutines that acquire
+independently — the second acquire replaces the first's token, and the first `Release` would then
+release the second's lease. Give each holder its own `cache.Lock(...)`.
+:::
 
 The lock name is namespaced, so `cache.Namespace("users").Lock("rebuild", ttl)` and
 `cache.Lock("rebuild", ttl)` are different locks.
@@ -99,8 +112,9 @@ or the timeout elapses.
 `ForceRelease` deletes the lock regardless of who owns it. It exists for operational recovery — a
 stuck lock you need to clear by hand — and is not something to reach for in normal flow.
 
-Reuse the same `*Lock` value for the acquire/release pair. Calling `cache.Lock(...)` again mints a
-new token, and releasing with it will not match.
+Reuse the same `*Lock` value for the acquire/release pair, as above — and reusing it for a later
+acquire is safe too, because each acquire re-mints its token. What does not work is releasing through
+a *different* value: `cache.Lock(...)` returns a value holding no token, so its `Release` is a no-op.
 
 ## Where locks live
 

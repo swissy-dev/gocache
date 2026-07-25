@@ -145,13 +145,13 @@ func TestCloseStopsSweeperAndKeepsDBOpen(t *testing.T) {
 
 func TestDialectSQL(t *testing.T) {
 	pg := buildQueries(Postgres, "gocache")
-	if !strings.Contains(pg.get, "$1") || !strings.Contains(pg.get, "$2") {
+	if !strings.Contains(pg.get, "$1") {
 		t.Fatalf("postgres get: %s", pg.get)
 	}
 	if !strings.Contains(pg.insertIgnore, "ON CONFLICT") || !strings.Contains(pg.insertIgnore, "DO NOTHING") {
 		t.Fatalf("postgres add: %s", pg.insertIgnore)
 	}
-	if !strings.Contains(pg.sweep, "IN (SELECT") || !strings.Contains(pg.sweep, "LIMIT $2") {
+	if !strings.Contains(pg.sweep, "IN (SELECT") || !strings.Contains(pg.sweep, "LIMIT $1") {
 		t.Fatalf("postgres sweep: %s", pg.sweep)
 	}
 	if !strings.Contains(pg.clearPrefix, `ESCAPE '\'`) {
@@ -184,6 +184,112 @@ func TestDialectSQL(t *testing.T) {
 	}
 	if !strings.Contains(lite.upsert, "excluded.") {
 		t.Fatalf("sqlite upsert: %s", lite.upsert)
+	}
+}
+
+func countPlaceholders(d Dialect, stmt string) int {
+	if d == Postgres {
+		return strings.Count(stmt, "$")
+	}
+	return strings.Count(stmt, "?")
+}
+
+func TestDialectSQLJudgesExpiryByDatabaseServerTime(t *testing.T) {
+	for _, tc := range []struct {
+		dialect Dialect
+		now     string
+		upsert  int
+	}{
+		{Postgres, "(EXTRACT(EPOCH FROM now()) * 1000)::bigint", 3},
+		{MySQL, "CAST(UNIX_TIMESTAMP(NOW(3)) * 1000 AS SIGNED)", 5},
+		{SQLite, "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)", 3},
+	} {
+		t.Run(string(tc.dialect), func(t *testing.T) {
+			q := buildQueries(tc.dialect, "gocache")
+			stmts := []struct {
+				name string
+				sql  string
+				args int
+			}{
+				{"get", q.get, 1},
+				{"upsert", q.upsert, tc.upsert},
+				{"insertIgnore", q.insertIgnore, 3},
+				{"del", q.del, 1},
+				{"delIfEquals", q.delIfEquals, 2},
+				{"deleteExpired", q.deleteExpired, 1},
+				{"sweep", q.sweep, 1},
+			}
+			for _, s := range stmts {
+				if !strings.Contains(s.sql, tc.now) {
+					t.Errorf("%s does not read the clock from the database: %s", s.name, s.sql)
+				}
+				if n := countPlaceholders(tc.dialect, s.sql); n != s.args {
+					t.Errorf("%s takes %d parameters, want %d — a client clock value is still bound: %s", s.name, n, s.args, s.sql)
+				}
+			}
+			for _, s := range []struct {
+				name string
+				sql  string
+			}{{"upsert", q.upsert}, {"insertIgnore", q.insertIgnore}} {
+				if !strings.Contains(s.sql, tc.now+" + ") {
+					t.Errorf("%s must offset the server clock by a ttl parameter: %s", s.name, s.sql)
+				}
+			}
+		})
+	}
+}
+
+func TestExpiryIsWrittenAndJudgedByTheDatabase(t *testing.T) {
+	d := newTestDriver(t)
+	ctx := context.Background()
+	if err := d.Set(ctx, "gone", []byte("v"), 50*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Set(ctx, "kept", []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Set(ctx, "long", []byte("v"), 5*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	expiry := func(key string) sql.NullInt64 {
+		t.Helper()
+		var v sql.NullInt64
+		if err := d.db.QueryRowContext(ctx, `SELECT "expires_at" FROM "gocache" WHERE "key" = ?`, key).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	if e := expiry("kept"); e.Valid {
+		t.Fatalf("a zero ttl must store a NULL expiry, got %d", e.Int64)
+	}
+	var dbNow int64
+	if err := d.db.QueryRowContext(ctx, `SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`).Scan(&dbNow); err != nil {
+		t.Fatal(err)
+	}
+	e := expiry("long")
+	if !e.Valid {
+		t.Fatal("a positive ttl must store an expiry")
+	}
+	if delta := e.Int64 - dbNow; delta <= 0 || delta > (5*time.Minute).Milliseconds() {
+		t.Fatalf("expiry is not database now + ttl: %d ms away from the server clock", delta)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	if _, ok, _ := d.Get(ctx, "gone"); ok {
+		t.Fatal("a row written with a ttl did not expire")
+	}
+	if _, ok, _ := d.Get(ctx, "kept"); !ok {
+		t.Fatal("a row written without a ttl expired")
+	}
+	if ok, err := d.Add(ctx, "gone", []byte("v2"), time.Hour); err != nil || !ok {
+		t.Fatalf("add did not reclaim an expired row: ok=%v err=%v", ok, err)
+	}
+	if ok, err := d.DeleteIfEquals(ctx, "kept", []byte("v")); err != nil || !ok {
+		t.Fatalf("delete if equals on a live row: ok=%v err=%v", ok, err)
+	}
+	if ok, err := d.Delete(ctx, "long"); err != nil || !ok {
+		t.Fatalf("delete on a live row: ok=%v err=%v", ok, err)
 	}
 }
 

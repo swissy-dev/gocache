@@ -120,28 +120,24 @@ func (d *Driver) Migrate(ctx context.Context) error {
 	return nil
 }
 
-func nowMS() int64 {
-	return time.Now().UnixMilli()
-}
-
-func expiresAt(ttl time.Duration) any {
+func ttlMS(ttl time.Duration) any {
 	if ttl <= 0 {
 		return nil
 	}
-	return time.Now().Add(ttl).UnixMilli()
+	return max(ttl.Milliseconds(), 1)
 }
 
-func (d *Driver) upsertArgs(key string, value []byte, exp any) []any {
-	args := []any{key, value, exp}
+func (d *Driver) upsertArgs(key string, value []byte, ttl any) []any {
+	args := []any{key, value, ttl}
 	if d.dialect == MySQL {
-		args = append(args, value, exp)
+		args = append(args, value, ttl)
 	}
 	return args
 }
 
 func (d *Driver) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	var value []byte
-	err := d.db.QueryRowContext(ctx, d.q.get, key, nowMS()).Scan(&value)
+	err := d.db.QueryRowContext(ctx, d.q.get, key).Scan(&value)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -152,7 +148,7 @@ func (d *Driver) Get(ctx context.Context, key string) ([]byte, bool, error) {
 }
 
 func (d *Driver) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	if _, err := d.db.ExecContext(ctx, d.q.upsert, d.upsertArgs(key, value, expiresAt(ttl))...); err != nil {
+	if _, err := d.db.ExecContext(ctx, d.q.upsert, d.upsertArgs(key, value, ttlMS(ttl))...); err != nil {
 		return fmt.Errorf("sqldriver: set: %w", err)
 	}
 	return nil
@@ -164,10 +160,10 @@ func (d *Driver) Add(ctx context.Context, key string, value []byte, ttl time.Dur
 		return false, fmt.Errorf("sqldriver: add begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, d.q.deleteExpired, key, nowMS()); err != nil {
+	if _, err := tx.ExecContext(ctx, d.q.deleteExpired, key); err != nil {
 		return false, fmt.Errorf("sqldriver: add cleanup: %w", err)
 	}
-	res, err := tx.ExecContext(ctx, d.q.insertIgnore, key, value, expiresAt(ttl))
+	res, err := tx.ExecContext(ctx, d.q.insertIgnore, key, value, ttlMS(ttl))
 	if err != nil {
 		return false, fmt.Errorf("sqldriver: add insert: %w", err)
 	}
@@ -182,7 +178,7 @@ func (d *Driver) Add(ctx context.Context, key string, value []byte, ttl time.Dur
 }
 
 func (d *Driver) Delete(ctx context.Context, key string) (bool, error) {
-	res, err := d.db.ExecContext(ctx, d.q.del, key, nowMS())
+	res, err := d.db.ExecContext(ctx, d.q.del, key)
 	if err != nil {
 		return false, fmt.Errorf("sqldriver: delete: %w", err)
 	}
@@ -215,7 +211,7 @@ func (d *Driver) DeleteMany(ctx context.Context, keys []string) error {
 }
 
 func (d *Driver) DeleteIfEquals(ctx context.Context, key string, value []byte) (bool, error) {
-	res, err := d.db.ExecContext(ctx, d.q.delIfEquals, key, value, nowMS())
+	res, err := d.db.ExecContext(ctx, d.q.delIfEquals, key, value)
 	if err != nil {
 		return false, fmt.Errorf("sqldriver: delete if equals: %w", err)
 	}
@@ -247,7 +243,7 @@ func (d *Driver) SweepOnce(ctx context.Context) (int64, error) {
 	var total int64
 	for {
 		sctx, cancel := context.WithTimeout(ctx, d.sweepTimeout)
-		res, err := d.db.ExecContext(sctx, d.q.sweep, nowMS(), d.sweepBatch)
+		res, err := d.db.ExecContext(sctx, d.q.sweep, d.sweepBatch)
 		cancel()
 		if err != nil {
 			return total, fmt.Errorf("sqldriver: sweep: %w", err)
