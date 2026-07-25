@@ -122,6 +122,55 @@ jobs:
           GOCACHE_TEST_REDIS: 127.0.0.1:6379
         run: go test -race -count=1 -tags integration ./...
 
+  cluster:
+    name: Redis cluster
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Start a three-master Redis cluster
+        run: |
+          docker run -d --name gocache-redis-cluster \
+            -p 7100:7100 -p 7101:7101 -p 7102:7102 \
+            redis:7 sh -c '
+              for port in 7100 7101 7102; do
+                redis-server --port "$port" --cluster-enabled yes \
+                  --cluster-config-file "nodes-$port.conf" --cluster-announce-ip 127.0.0.1 \
+                  --dir /tmp --appendonly no --save "" --daemonize yes
+              done
+              until redis-cli -p 7100 ping && redis-cli -p 7101 ping && redis-cli -p 7102 ping; do sleep 1; done
+              redis-cli --cluster create 127.0.0.1:7100 127.0.0.1:7101 127.0.0.1:7102 --cluster-yes
+              tail -f /dev/null
+            '
+          for _ in $(seq 60); do
+            converged=0
+            for port in 7100 7101 7102; do
+              info=$(docker exec gocache-redis-cluster redis-cli -p "$port" cluster info 2>/dev/null || true)
+              case "$info" in
+                *cluster_state:ok*cluster_slots_assigned:16384*) converged=$((converged + 1)) ;;
+              esac
+            done
+            if [ "$converged" -eq 3 ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs gocache-redis-cluster
+          for port in 7100 7101 7102; do
+            docker exec gocache-redis-cluster redis-cli -p "$port" cluster info || true
+          done
+          exit 1
+
+      - name: Run the driver conformance suite against a Redis cluster
+        env:
+          GOCACHE_TEST_REDIS_CLUSTER: 127.0.0.1:7100,127.0.0.1:7101,127.0.0.1:7102
+        run: go test -race -count=1 -tags integration ./driver/redisdriver/
+
   docs:
     name: Docs
     runs-on: ubuntu-latest

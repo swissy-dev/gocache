@@ -218,4 +218,14 @@ demand. Skip rather than fail when the environment variable is absent, so a deve
 infrastructure still gets a green suite.
 
 gocache's own suite is organised this way, and runs its shared driver conformance suite against real
-Postgres, MySQL and Redis behind a build tag.
+Postgres, MySQL and Redis behind a build tag. Each backend has its own variable — `GOCACHE_TEST_POSTGRES`,
+`GOCACHE_TEST_MYSQL`, `GOCACHE_TEST_REDIS`, and `GOCACHE_TEST_REDIS_CLUSTER` holding comma-separated
+node addresses — and everything skips when the variable is unset:
+
+```bash
+GOCACHE_TEST_REDIS_CLUSTER=127.0.0.1:7100,127.0.0.1:7101,127.0.0.1:7102 \
+  go test -race -tags integration ./driver/redisdriver/
+```
+
+The cluster suite covers what miniredis cannot emulate: that a multi-key delete spanning hash slots
+succeeds, and that clearing a prefix reaches every master rather than one.
