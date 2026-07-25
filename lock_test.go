@@ -247,3 +247,33 @@ func TestLockExpiresWithTTL(t *testing.T) {
 		}
 	})
 }
+
+func TestLockRejectsNonPositiveTTL(t *testing.T) {
+	c, _ := newTestCache(t)
+	ctx := context.Background()
+
+	for _, ttl := range []time.Duration{0, -time.Second} {
+		ok, err := c.Lock("job", ttl).Acquire(ctx)
+		if err == nil {
+			t.Fatalf("ttl %v: expected an error, got ok=%v", ttl, ok)
+		}
+		if ok {
+			t.Fatalf("ttl %v: acquired a lock that would never expire", ttl)
+		}
+	}
+
+	if err := c.Lock("job", 0).Do(ctx, func(context.Context) error {
+		t.Fatal("callback must not run")
+		return nil
+	}); err == nil {
+		t.Fatal("Do: expected an error for a non-positive ttl")
+	}
+
+	if err := c.Lock("job", 0).Block(ctx, time.Second); err == nil {
+		t.Fatal("Block: expected an error for a non-positive ttl")
+	}
+
+	if ok, err := c.Lock("job", time.Minute).Acquire(ctx); err != nil || !ok {
+		t.Fatalf("a valid lock must still acquire: ok=%v err=%v", ok, err)
+	}
+}

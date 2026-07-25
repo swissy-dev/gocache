@@ -73,10 +73,10 @@ across the fleet, mostly duplicates. That is the intended trade — local reads 
 instance's worth, not the whole data set.
 
 **Large values in a two-tier cache are stored twice.** Once in L2, once in every L1 that reads them.
-`WithSkipL1` does not prevent that — it only suppresses the write-through on that call. The next
-read that finds the entry fresh in L2 backfills L1 anyway, unconditionally, with no flag to stop it,
-so `WithSkipL1` defers the copy into L1 rather than preventing it. To keep a value out of L1
-entirely, give it a cache built with only `WithL2`, no `WithL1`.
+`WithSkipL1` keeps the value out of L1 on that write, removing any copy already there. It does not
+prevent the copy forever: the next read that finds the entry fresh in L2 backfills L1 as usual, with
+no flag to stop it. To keep a value out of L1 entirely, give it a cache built with only `WithL2`,
+no `WithL1`.
 
 ## As a single-tier cache
 

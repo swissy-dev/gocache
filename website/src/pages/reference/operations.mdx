@@ -94,8 +94,9 @@ func (l *Lock) Do(ctx context.Context, fn func(context.Context) error) error
 ```
 
 `Do` acquires, runs, and releases — including on panic — and returns `ErrLockHeld` if the lock is
-taken. `Block` waits with jittered backoff and returns `ErrLockTimeout` on expiry. `Release` is a
-no-op when the owner token no longer matches.
+taken. `Block` waits with jittered backoff and returns `ErrLockTimeout` on expiry. All three return
+`ErrLockTTL` if the lock was created with a zero or negative TTL. `Release` is a no-op when the
+owner token no longer matches.
 
 See [Atomic locks](/features/locks).
 

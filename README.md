@@ -449,7 +449,7 @@ cache write failure after the factory has already succeeded. That last one retur
 value with a **nil error** even though the write didn't happen — the same failure through plain
 `Set` is returned as an error — so `EventWriteFailed` is the signal to watch. `Lock.Do` swallows a
 failed `Release` the same way, but only to the logger; there's no event for it. Sentinels:
-`ErrClosed`, `ErrLockTimeout`, `ErrLockHeld`.
+`ErrClosed`, `ErrLockTimeout`, `ErrLockHeld`, `ErrLockTTL`.
 
 ### Drivers
 

@@ -33,6 +33,9 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 	if l.cache.rt.closed.Load() {
 		return false, ErrClosed
 	}
+	if l.ttl <= 0 {
+		return false, ErrLockTTL
+	}
 	ok, err := l.cache.authoritative().Add(ctx, l.key, l.token, l.ttl)
 	if err != nil {
 		return false, fmt.Errorf("gocache: lock acquire: %w", err)

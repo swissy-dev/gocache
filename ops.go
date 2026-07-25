@@ -36,6 +36,7 @@ func (c *Cache) readTier(ctx context.Context, d Driver, fullKey string) (envelop
 
 func (c *Cache) read(ctx context.Context, fullKey string) (readResult, error) {
 	now := c.cfg.clock()
+	var staleL1 readResult
 	if c.cfg.l1 != nil {
 		env, ok, err := c.readTier(ctx, c.cfg.l1, fullKey)
 		if err != nil {
@@ -47,6 +48,9 @@ func (c *Cache) read(ctx context.Context, fullKey string) (readResult, error) {
 		if c.cfg.l2 == nil {
 			return readResult{env: env, found: ok, tier: TierL1}, nil
 		}
+		if ok {
+			staleL1 = readResult{env: env, found: true, tier: TierL1}
+		}
 	}
 	if c.cfg.l2 != nil {
 		env, ok, err := c.readTier(ctx, c.cfg.l2, fullKey)
@@ -54,7 +58,7 @@ func (c *Cache) read(ctx context.Context, fullKey string) (readResult, error) {
 			return readResult{}, err
 		}
 		if !ok {
-			return readResult{}, nil
+			return staleL1, nil
 		}
 		if env.fresh(now) {
 			c.backfillL1(ctx, fullKey, env, now)
@@ -111,8 +115,12 @@ func (c *Cache) writeEnvelope(ctx context.Context, fullKey string, env envelope,
 	}
 	var l1err error
 	authOK := true
-	if c.cfg.l1 != nil && !o.skipL1 {
-		if err := c.cfg.l1.Set(ctx, fullKey, raw, ttl); err != nil {
+	if c.cfg.l1 != nil {
+		if o.skipL1 {
+			if _, err := c.cfg.l1.Delete(ctx, fullKey); err != nil {
+				c.logf("l1 skip delete failed", "key", fullKey, "err", err)
+			}
+		} else if err := c.cfg.l1.Set(ctx, fullKey, raw, ttl); err != nil {
 			l1err = fmt.Errorf("gocache: l1 set: %w", err)
 			if c.cfg.l2 == nil {
 				authOK = false

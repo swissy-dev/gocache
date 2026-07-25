@@ -443,3 +443,35 @@ func TestEventsHitMiss(t *testing.T) {
 		t.Fatalf("miss=%v hit=%v written=%v", miss, hit, written)
 	}
 }
+
+func TestSkipL1RemovesAnyExistingL1Copy(t *testing.T) {
+	l1 := memory.New()
+	l2 := memory.New()
+	c, err := New(WithL1(l1), WithL2(l2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx := context.Background()
+	if err := Set(ctx, c, "k", user{Name: "v1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Set(ctx, c, "k", user{Name: "v2"}, WithSkipL1()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok, err := l1.Get(ctx, "k"); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("WithSkipL1 left a stale copy in l1")
+	}
+
+	got, found, err := Get[user](ctx, c, "k")
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	if got.Name != "v2" {
+		t.Fatalf("served a stale value after WithSkipL1: %+v", got)
+	}
+}
