@@ -75,8 +75,9 @@ func (c *Cache) Close() error
 `Delete` reports whether a live entry was removed. Deletes are delete-through across both tiers,
 combining independent tier failures.
 
-`Clear` removes every key under the current namespace prefix. On a root cache that prefix is empty —
-see the [warning](/concepts/keys-and-namespaces).
+`Clear` removes every data entry under the current namespace, and only those. It never reaches
+another application's keys, gocache's own tag markers, or a held lock — see [Keys and
+namespaces](/concepts/keys-and-namespaces).
 
 `Namespace` returns a derived cache sharing the parent's drivers, bus and lifecycle.
 

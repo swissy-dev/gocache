@@ -113,7 +113,7 @@ func TestTwoTierBackfill(t *testing.T) {
 	if _, ok, _ := Get[user](ctx, c, "u"); !ok {
 		t.Fatal("expected L2 hit")
 	}
-	if _, ok, _ := l1.Get(ctx, "u"); !ok {
+	if _, ok, _ := l1.Get(ctx, c.key("u")); !ok {
 		t.Fatal("expected L1 backfill")
 	}
 }
@@ -134,10 +134,10 @@ func TestDeleteRemovesBothTiers(t *testing.T) {
 	if err != nil || !existed {
 		t.Fatalf("existed=%v err=%v", existed, err)
 	}
-	if _, ok, _ := l2.Get(ctx, "u"); ok {
+	if _, ok, _ := l2.Get(ctx, c.key("u")); ok {
 		t.Fatal("still in l2")
 	}
-	if _, ok, _ := l1.Get(ctx, "u"); ok {
+	if _, ok, _ := l1.Get(ctx, c.key("u")); ok {
 		t.Fatal("still in l1")
 	}
 }
@@ -212,7 +212,7 @@ func TestNegativeGraceCannotProduceImmortalEntry(t *testing.T) {
 	if err := Set(ctx, c, "u", user{Name: "ana"}, WithTTL(time.Minute), WithGrace(-2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := l1.Get(ctx, "u"); !ok {
+	if _, ok, _ := l1.Get(ctx, c.key("u")); !ok {
 		t.Fatal("expected entry to be stored in l1 immediately after Set")
 	}
 
@@ -330,7 +330,7 @@ func TestSetPublishesWhenOnlyTheL1WriteFails(t *testing.T) {
 	if err := Set(ctx, c, "u", user{Name: "ana"}); err == nil {
 		t.Fatal("expected the l1 write failure to be returned")
 	}
-	if _, ok, err := l2.Get(ctx, "u"); err != nil || !ok {
+	if _, ok, err := l2.Get(ctx, c.key("u")); err != nil || !ok {
 		t.Fatalf("l2 must hold the value, ok=%v err=%v", ok, err)
 	}
 	if got := bus.count(); got != 1 {
@@ -357,7 +357,7 @@ func TestDeletePublishesWhenOnlyTheL1DeleteFails(t *testing.T) {
 	if _, err := c.Delete(ctx, "u"); err == nil {
 		t.Fatal("expected the l1 delete failure to be returned")
 	}
-	if _, ok, err := l2.Get(ctx, "u"); err != nil || ok {
+	if _, ok, err := l2.Get(ctx, c.key("u")); err != nil || ok {
 		t.Fatalf("l2 must have dropped the value, ok=%v err=%v", ok, err)
 	}
 	if got := bus.count(); got != before+1 {
@@ -385,7 +385,7 @@ func TestPhysicalTTLGraceKeepsEntryPhysicallyPresent(t *testing.T) {
 		clk.Advance(advance)
 		time.Sleep(advance)
 
-		if _, ok, err := l1.Get(ctx, "u"); err != nil || !ok {
+		if _, ok, err := l1.Get(ctx, c.key("u")); err != nil || !ok {
 			t.Fatalf("expected entry to still be physically present in l1 under grace, ok=%v err=%v", ok, err)
 		}
 		if _, ok, err := Get[user](ctx, c, "u"); err != nil || ok {
@@ -461,7 +461,7 @@ func TestSkipL1RemovesAnyExistingL1Copy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, ok, err := l1.Get(ctx, "k"); err != nil {
+	if _, ok, err := l1.Get(ctx, c.key("k")); err != nil {
 		t.Fatal(err)
 	} else if ok {
 		t.Fatal("WithSkipL1 left a stale copy in l1")

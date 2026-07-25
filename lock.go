@@ -9,8 +9,6 @@ import (
 	"time"
 )
 
-const lockPrefix = "__gocache:lock:"
-
 type Lock struct {
 	cache *Cache
 	key   string
@@ -23,7 +21,7 @@ func (c *Cache) Lock(name string, ttl time.Duration) *Lock {
 	crand.Read(b)
 	return &Lock{
 		cache: c,
-		key:   lockPrefix + c.key(name),
+		key:   c.lockKey(name),
 		ttl:   ttl,
 		token: []byte(hex.EncodeToString(b)),
 	}

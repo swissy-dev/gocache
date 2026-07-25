@@ -239,15 +239,15 @@ it stop matching. Cost is the same whether the tag covers ten keys or ten millio
 
 ### Namespaces
 
-A namespace is a derived cache that prefixes its keys. Use them to keep subsystems from colliding and
-to get a `Clear` that's bounded to your own data:
+A namespace is a derived cache that adds a segment to its keys. Use them to keep subsystems from
+colliding and to clear one subsystem without discarding the rest:
 
 ```go
 users := cache.Namespace("users")
 posts := cache.Namespace("posts")
 
-err := gocache.Set(ctx, users, "42", user)   // stored as "users:42"
-err = users.Clear(ctx)                        // clears only "users:*"
+err := gocache.Set(ctx, users, "42", user)   // stored as "gocache:1:d:users:42"
+err = users.Clear(ctx)                        // clears only "gocache:1:d:users:*"
 ```
 
 Namespaces share the parent's drivers, bus and lifecycle. Tags are global, so one tag can span
@@ -390,45 +390,41 @@ mutual exclusion.
 | `c.Lock(name, ttl)` | distributed atomic lock |
 | `c.Close()` | stops background goroutines and closes bus and drivers |
 
-> ### WARNING — `Clear()` on a **root** cache clears the entire keyspace of the store
->
-> `Clear` is `ClearPrefix(namespacePrefix)` on every tier, and a root cache's prefix is empty. gocache has
-> no global key prefix, so it cannot tell its own keys from anyone else's: `c.Clear(ctx)` on a root cache
-> deletes **every key in the underlying store, including keys gocache never wrote**. For Redis that is
-> every key in the selected logical database — sessions, queues, rate limiters, everything.
->
-> If the store is shared with anything else, keep cache data under a namespace (which prefixes its keys
-> with `cache:`) and clear that instead — it is bounded to the prefix:
->
-> ```go
-> app := c.Namespace("cache")
-> err := app.Clear(ctx)
-> ```
->
-> A root `Clear` also removes gocache's own lock keys (`__gocache:lock:*`) and tag keys
-> (`__gocache:tag:*`), so held locks are released and tag invalidation history is lost.
+`Clear` is bounded to gocache's own data domain: `gocache:1:d:*` on a root cache, `gocache:1:d:<namespace>:*`
+inside a namespace. It cannot reach keys gocache never wrote, so a root `Clear` on a Redis database shared
+with sessions, queues or rate limiters leaves them alone. Tag markers and lock keys live in separate
+domains and also survive — clearing a cache does not release a lock another process is holding, and does
+not discard tag invalidation history.
 
 Notes:
 
-- `__gocache:` is a reserved key prefix (lock and tag keys live there). Application keys must not start
-  with it — this is a convention, not something gocache validates.
+- Every stored key is `<prefix>:1:<domain>:...` where `<prefix>` defaults to `gocache` (`WithKeyPrefix`)
+  and `<domain>` is `d` for data, `t` for tag markers, `l` for locks. Every variable segment is escaped
+  (`\` → `\\`, `:` → `\:`) before the segments are joined with `:`, so the encoding is unambiguous:
+  `Namespace("a")` + key `"b:c"` stores `gocache:1:d:a:b\:c`, while `Namespace("a:b")` + key `"c"` stores
+  `gocache:1:d:a\:b:c`.
+- No key name is reserved. Tag markers and locks are not in the data domain, so an application key called
+  `__gocache:tag:users` is an ordinary entry and cannot suppress a tag invalidation or disturb a lock.
 - `c.Namespace(name)` returns a cache sharing the parent's drivers, bus and **lifecycle**. Calling
   `Close()` on a namespace closes the root cache — and therefore every other namespace derived from it.
 - Every operation returns `ErrClosed` once the cache is closed.
 
 ### Options
 
-Constructor: `WithL1`, `WithL2`, `WithBus`, `WithDefaultTTL`, `WithDefaultGrace`, `WithSoftTimeout`,
-`WithHardTimeout`, `WithTagCacheTTL`, `WithCodec`, `WithClock`, `WithEventHook`, `WithLogger`,
-`WithBusRetryQueueSize`.
+Constructor: `WithL1`, `WithL2`, `WithBus`, `WithKeyPrefix`, `WithDefaultTTL`, `WithDefaultGrace`,
+`WithSoftTimeout`, `WithHardTimeout`, `WithTagCacheTTL`, `WithCodec`, `WithClock`, `WithEventHook`,
+`WithLogger`, `WithBusRetryQueueSize`.
 
 Per call: `WithTTL`, `WithTags`, `WithGrace`, `WithCallSoftTimeout`, `WithCallHardTimeout`,
 `WithSkipL1`, `WithSkipBus`.
 
-Defaults: TTL 30 minutes, grace off, timeouts off, tag-cache TTL 10 seconds, JSON codec,
-`slog.Default()`, bus retry queue 1024. `New` validates its options and returns an error rather than
-failing later — a cache with no tier, a bus without both tiers, a nil driver or a negative duration
-are all rejected at construction.
+Defaults: key prefix `gocache`, TTL 30 minutes, grace off, timeouts off, tag-cache TTL 10 seconds, JSON
+codec, `slog.Default()`, bus retry queue 1024. `New` validates its options and returns an error rather
+than failing later — a cache with no tier, a bus without both tiers, a nil driver, a negative duration or
+an empty key prefix are all rejected at construction.
+
+`WithKeyPrefix(s)` replaces the leading `gocache` segment, letting two applications share one Redis logical
+database without seeing, overwriting or clearing each other's entries.
 
 `WithGrace(d)` bounds staleness for the call: a stale entry is served only while it is within `d` of its
 logical expiry, even when the constructor default is larger.
@@ -467,14 +463,10 @@ treat everything below that as opaque.
 | SQL | `driver/sqldriver` | Postgres, MySQL, SQLite; caller-owned `*sql.DB` |
 | Null | `driver/null` | stores nothing |
 
-> ### WARNING — Redis and a root `Clear()`
->
-> A root `Clear` reaches the Redis driver as `ClearPrefix("")`, which is `SCAN MATCH *` plus `DEL` — the
-> practical equivalent of `FLUSHDB` on the selected logical database. Sharing one Redis database between
-> gocache and sessions/queues/anything else is common, so never call `Clear` on a root cache in that
-> setup: clear a namespace (`c.Namespace("cache").Clear(ctx)`), or give the cache its own logical
-> database. The SQL driver is inherently bounded to its own table, and the memory driver to its own
-> process-local map.
+A root `Clear` reaches the Redis driver as `ClearPrefix("gocache:1:d:")`, never `ClearPrefix("")`, so it is
+`SCAN MATCH gocache:1:d:*` plus `DEL` rather than the equivalent of `FLUSHDB`. Sharing one Redis logical
+database between gocache and sessions, queues or anything else is safe; use `WithKeyPrefix` to separate two
+gocache instances sharing one.
 
 The SQL driver never configures the connection pool — set `SetMaxOpenConns`, `SetMaxIdleConns`,
 `SetConnMaxLifetime` and `SetConnMaxIdleTime` on the `*sql.DB` you pass in. Create its table with

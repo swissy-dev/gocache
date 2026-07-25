@@ -2,20 +2,40 @@
 
 ## Keys
 
-A key is any string. gocache stores it in the underlying driver exactly as given, prefixed only by
-the namespace you're operating in.
+A key is any string, but gocache does not hand it to the driver unchanged. Every stored key carries
+a mandatory prefix naming the library, the key-format version, and which kind of thing is being
+stored:
 
-Two rules:
+```
+gocache:1:d:<namespace...>:<key>    data entries
+gocache:1:t:<tag>                   tag markers
+gocache:1:l:<namespace...>:<name>   locks
+```
 
-**`__gocache:` is reserved.** Lock keys live at `__gocache:lock:<name>` and tag markers at
-`__gocache:tag:<name>`. An application key starting with `__gocache:` collides with that internal
-space. This is a convention, not something gocache validates — nothing will stop you, and the
-failure mode is confusing, so don't.
+The leading `gocache` is configurable with [`WithKeyPrefix`](/reference/options); the `1` is the
+version of this layout. Namespace segments appear only when you are working inside a namespace.
 
-**Keys are not escaped.** If you build keys from user input, sanitise it yourself. A key containing
-a colon is fine and idiomatic (`user:42:preferences`), but it means a key written through
-`Set(ctx, cache.Namespace("a"), "b:c", value)` lands at the same underlying string as one written
-through `Set(ctx, cache.Namespace("a:b"), "c", value)` — both resolve to `"a:b:c"`.
+**Segments are escaped, which makes the encoding unambiguous.** Every variable part — each
+namespace name, the key, the tag, the lock name, and the configured prefix — has `\` rewritten as
+`\\` and `:` as `\:` before the parts are joined with `:`. A colon in a key stays fine and idiomatic
+(`user:42:preferences`) and can no longer be mistaken for a namespace boundary:
+
+```go
+gocache.Set(ctx, cache.Namespace("a"), "b:c", value)   // gocache:1:d:a:b\:c
+gocache.Set(ctx, cache.Namespace("a:b"), "c", value)   // gocache:1:d:a\:b:c
+```
+
+Those were the same underlying string before the escaping existed. They are now distinct entries,
+and one cannot be read or cleared through the other.
+
+**No key name is reserved.** Tag markers and locks live in their own domains (`:t:` and `:l:`), not
+in the data domain your keys land in, so an application key literally called `__gocache:tag:users`
+is just an ordinary entry. It cannot suppress a tag invalidation, and an application `Delete` cannot
+free somebody's lock.
+
+**Keys are still not validated.** Escaping makes the encoding unambiguous; it does not sanitise. If
+you build keys from user input, bound its length and content yourself — some drivers cap key size
+(the MySQL schema at 255 bytes, for instance).
 
 A convention that ages well is `entity:id:aspect`:
 
@@ -32,14 +52,14 @@ A convention that ages well is `entity:id:aspect`:
 ```go
 users := cache.Namespace("users")
 
-err := gocache.Set(ctx, users, "42", user)   // stored as "users:42"
+err := gocache.Set(ctx, users, "42", user)   // stored as "gocache:1:d:users:42"
 value, found, err := gocache.Get[User](ctx, users, "42")
 ```
 
-They nest, concatenating as they go:
+They nest, appending a segment as they go:
 
 ```go
-cache.Namespace("users").Namespace("permissions")   // keys become "users:permissions:..."
+cache.Namespace("users").Namespace("permissions")   // gocache:1:d:users:permissions:...
 ```
 
 ### What namespaces are for
@@ -47,29 +67,28 @@ cache.Namespace("users").Namespace("permissions")   // keys become "users:permis
 **Keeping subsystems apart.** Two teams both caching under `settings` will not collide if each works
 inside its own namespace.
 
-**Bounded clearing.** This is the important one. `Clear` on a namespace removes only keys carrying
-that prefix:
+**Bounded clearing.** `Clear` removes only data-domain keys under the namespace you call it on:
 
 ```go
-err := cache.Namespace("users").Clear(ctx)   // clears "users:*" only
+err := cache.Namespace("users").Clear(ctx)   // clears "gocache:1:d:users:*"
+err = cache.Clear(ctx)                       // clears "gocache:1:d:*"
 ```
 
-Whereas `Clear` on the root cache clears **everything in the underlying store**:
+:::note[What a root Clear reaches]
+A root `Clear` removes every data entry this cache wrote, including entries written through every
+namespace derived from it — and nothing else. It cannot touch keys that do not carry gocache's
+prefix, so sharing one Redis logical database with sessions, queues or rate limiters is safe.
 
-:::danger[Clear on a root cache is not scoped to gocache]
-A root cache has an empty prefix, and gocache has no global key prefix of its own — so it cannot
-distinguish its keys from anyone else's. `cache.Clear(ctx)` on a root cache deletes every key in the
-store, including keys gocache never wrote. On Redis that is the practical equivalent of `FLUSHDB` on
-the selected logical database: sessions, queues, rate limiters, everything.
+Tag markers and locks live in their own domains and survive a `Clear`. Clearing a cache does not
+release a lock another process is holding, and does not discard tag invalidation history — a
+deliberate choice, since neither is cache data.
 
-If the store is shared with anything else, keep cache data inside a namespace and clear that
-instead. A root `Clear` also removes gocache's own lock and tag keys, releasing held locks and
-discarding tag invalidation history.
+Two caches over the same store configured with different [`WithKeyPrefix`](/reference/options)
+values are likewise invisible to each other's reads and clears.
 :::
 
-The SQL driver is inherently bounded to its own table, and the memory driver to its own map, so this
-is sharpest with Redis. Giving the cache its own Redis logical database is the other way to make a
-root `Clear` safe.
+Namespacing still earns its keep for reasons other than blast radius: it keeps subsystems from
+colliding, and it lets you clear one subsystem's data without discarding the rest.
 
 ### What namespaces share
 
@@ -86,7 +105,8 @@ defers `Close` on it, it will shut down caching for the entire application. Clos
 
 ### Namespaces and tags
 
-Tags are global. A tag key is not namespaced, so one tag can span several namespaces:
+Tags are global. A tag marker is stored at `gocache:1:t:<tag>`, outside any namespace, so one tag
+can span several namespaces:
 
 ```go
 err := gocache.Set(ctx, cache.Namespace("users"), "42", user, gocache.WithTags("tenant:7"))
@@ -99,4 +119,4 @@ That is deliberate: tags exist to express relationships that cut across the stor
 [Tags](/features/tags).
 
 Lock names, by contrast, *are* namespaced — `cache.Namespace("users").Lock("rebuild", ttl)` acquires
-a different lock than `cache.Lock("rebuild", ttl)`.
+`gocache:1:l:users:rebuild`, a different lock than `cache.Lock("rebuild", ttl)`.

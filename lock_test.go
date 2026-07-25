@@ -162,11 +162,15 @@ func TestLockNamespacePrefix(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 	ctx := context.Background()
-	if ok, err := c.Namespace("users").Lock("job", time.Minute).Acquire(ctx); err != nil || !ok {
+	users := c.Namespace("users")
+	if ok, err := users.Lock("job", time.Minute).Acquire(ctx); err != nil || !ok {
 		t.Fatalf("ok=%v err=%v", ok, err)
 	}
-	if _, found, _ := l1.Get(ctx, "__gocache:lock:users:job"); !found {
+	if _, found, _ := l1.Get(ctx, users.lockKey("job")); !found {
 		t.Fatal("lock key is not namespaced")
+	}
+	if _, found, _ := l1.Get(ctx, c.lockKey("job")); found {
+		t.Fatal("a namespaced lock must not land on the root lock key")
 	}
 }
 
@@ -182,10 +186,10 @@ func TestLockLivesOnL2(t *testing.T) {
 	if ok, err := c.Lock("job", time.Minute).Acquire(ctx); err != nil || !ok {
 		t.Fatalf("ok=%v err=%v", ok, err)
 	}
-	if _, found, _ := l2.Get(ctx, "__gocache:lock:job"); !found {
+	if _, found, _ := l2.Get(ctx, c.lockKey("job")); !found {
 		t.Fatal("lock must live on l2")
 	}
-	if _, found, _ := l1.Get(ctx, "__gocache:lock:job"); found {
+	if _, found, _ := l1.Get(ctx, c.lockKey("job")); found {
 		t.Fatal("lock must not touch l1")
 	}
 }

@@ -113,7 +113,7 @@ Factory signature: `func(ctx context.Context) (T, error)`.
 
 Two exported option types: `Option` (constructor) and `CallOption` (per-call).
 
-- Constructor: `WithL1`, `WithL2`, `WithBus`, `WithDefaultTTL`, `WithDefaultGrace`, `WithSoftTimeout`, `WithHardTimeout`, `WithCodec`, `WithClock`, `WithEventHook`, `WithLogger`, `WithBusRetryQueueSize`.
+- Constructor: `WithL1`, `WithL2`, `WithBus`, `WithKeyPrefix`, `WithDefaultTTL`, `WithDefaultGrace`, `WithSoftTimeout`, `WithHardTimeout`, `WithCodec`, `WithClock`, `WithEventHook`, `WithLogger`, `WithBusRetryQueueSize`.
 - Per-call: `WithTTL(d)`, `WithTags(...)`, `WithGrace(d)` (0 disables for the call), `WithCallSoftTimeout(d)`, `WithCallHardTimeout(d)`, `WithSkipL1()` (also removes any existing L1 copy, so the writer cannot serve an older value than its peers), `WithSkipBus()`.
 
 Per-call options override constructor defaults. Defaults: TTL 30 m, grace off, timeouts off.
@@ -226,19 +226,35 @@ Flights are **owned by the cache, not by any caller** — this avoids the classi
 
 ### Set / Delete / DeleteMany / Clear
 
-Write-through or delete-through: L2 first, then L1, then bus publish. `Clear` = `ClearPrefix(namespacePrefix)` on both tiers + bus broadcast.
+Write-through or delete-through: L2 first, then L1, then bus publish. `Clear` = `ClearPrefix` of the current namespace's data-domain prefix (§7) on both tiers + bus broadcast; it is never called with an empty prefix.
 
-## 7. Tags and namespaces
+## 7. Key layout, tags and namespaces
+
+### Key layout
+
+Every stored key is domain-separated and versioned:
+
+```
+<prefix>:1:d:<ns...>:<key>    data entries
+<prefix>:1:t:<tag>            tag markers
+<prefix>:1:l:<ns...>:<name>   locks
+```
+
+`<prefix>` defaults to `gocache` and is set with `WithKeyPrefix` (empty or whitespace-only is rejected by `New`), so two applications can share one logical database. `1` is the layout version. Namespace segments appear only when the cache is not a root cache.
+
+Every variable segment — each namespace name, the key, the tag, the lock name, and the configured prefix — is escaped before the segments are joined with `:`: `\` → `\\` and `:` → `\:` (one pass, via `strings.Replacer`). That makes the encoding injective: `Namespace("a")` + key `"b:c"` stores `gocache:1:d:a:b\:c`, while `Namespace("a:b")` + key `"c"` stores `gocache:1:d:a\:b:c`. It also makes the prefix match used by `Clear` sound — an escaped segment can never contain the unescaped `:` that ends a namespace.
+
+No application key is reserved. Because tag markers and locks are in their own domains, an application key literally named `__gocache:tag:users` or `__gocache:lock:job` is an ordinary data entry and cannot suppress a tag invalidation or disturb a lock.
 
 ### Tags
 
-`DeleteByTag(tag)` writes the current clock timestamp to `__gocache:tag:<tag>` (raw unix-ms value, stored forever) in L2 (or the sole tier) and publishes it on the bus. On read, if an envelope has tags, the stack fetches each tag's timestamp and treats the entry as a miss when `createdAt <= tagInvalidatedAt`, so a write racing an invalidation in the same millisecond loses.
+`DeleteByTag(tag)` writes the current clock timestamp to `<prefix>:1:t:<tag>` (raw unix-ms value, stored forever) in L2 (or the sole tier) and publishes it on the bus. On read, if an envelope has tags, the stack fetches each tag's timestamp and treats the entry as a miss when `createdAt <= tagInvalidatedAt`, so a write racing an invalidation in the same millisecond loses.
 
 Tag timestamps are cached in L1 with a short TTL (default 10 s, configurable) so lookups are usually local; the bus makes invalidation immediate, and the short TTL bounds staleness to ~10 s even with the bus down. Untagged entries never touch tag keys.
 
 ### Namespaces
 
-`c.Namespace("users")` returns a derived `*Cache` sharing drivers, bus, and config, prefixing keys with `users:`; nesting concatenates (`users:posts:`). `Clear` on a namespace prefix-clears only its keys. Tag keys are global and unprefixed, so a tag can span namespaces. Lock names are namespace-prefixed.
+`c.Namespace("users")` returns a derived `*Cache` sharing drivers, bus, and config, carrying the escaped colon-joined namespace path (`users`); nesting appends a segment (`users:posts`). `Clear` prefix-clears the data domain for that path only — `<prefix>:1:d:` on a root cache, `<prefix>:1:d:users:` inside a namespace — so it can reach neither foreign keys, nor tag markers, nor locks. A root `Clear` therefore no longer releases held locks or discards tag invalidation history. Tag markers are global and carry no namespace, so a tag can span namespaces. Lock names are namespace-scoped.
 
 ## 8. Bus
 
@@ -255,11 +271,12 @@ type Bus interface {
 One channel (default `gocache:bus`, configurable). JSON messages:
 
 ```json
-{"o": "<origin-id>", "op": "delete|clear|tag", "k": ["user:42"], "p": "users:", "t": "users"}
+{"o": "<origin-id>", "op": "delete|clear|tag", "k": ["gocache:1:d:user\\:42"], "p": "gocache:1:d:users:", "t": "users"}
 ```
 
 - Each instance generates a random origin ID at startup and ignores its own messages.
 - On receipt: `delete` evicts the listed keys from L1; `clear` prefix-evicts L1; `tag` evicts the cached tag-timestamp key so the next read refetches it. L2 is never touched — it is already correct.
+- `k` and `p` carry fully-encoded keys and prefixes (§7); `t` carries the raw tag name and the receiver applies its own prefix. Two caches with different `WithKeyPrefix` values sharing one bus channel therefore exchange inert `delete`/`clear` messages, and a `tag` message only makes the peer refetch its own tag marker — correct, if mildly wasteful. Give them separate channels if that matters.
 - Set operations publish a `delete` for the written keys (peers drop stale L1 copies and re-read from L2 on demand).
 - **Publish failures are asynchronous by design** (§9 exception): they go to a bounded in-memory retry queue (default 1 024 messages, `WithBusRetryQueueSize`) drained with backoff by a cache-owned goroutine that exits via the lifecycle context and is joined by `Close`. On overflow the oldest message is dropped and `EventBusPublishFailed` fires per drop; messages still queued at `Close` are dropped (staleness stays bounded by L1 logical TTLs). Worst case with the bus fully down: peers serve their L1 copy until its logical TTL expires.
 
@@ -298,9 +315,9 @@ err = lock.ForceRelease(ctx)
 
 - Each `Lock` value holds a crypto/rand owner token. `Release` deletes via `DeleteIfEquals(key, token)` — a lock re-acquired by someone else after TTL expiry cannot be released by the old holder.
 - `Acquire` → driver `Add` with the lock TTL. `Block` retries with jittered backoff (default 50–250 ms, `time.NewTimer`+`Reset`, select on `ctx.Done()`) until acquired, ctx canceled, or timeout → `ErrLockTimeout`. `Do` = acquire (`ErrLockHeld` if taken), run, release via `defer` (runs on panic too).
-- Lock keys: `__gocache:lock:<namespaced name>`, stored on L2 when present (distributed), else the sole driver. Locks bypass L1, envelopes, tags, and the bus.
+- Lock keys: `<prefix>:1:l:<namespaced name>` (§7), stored on L2 when present (distributed), else the sole driver. Locks bypass L1, envelopes, tags, and the bus.
 - TTL is the deadlock ceiling: a crashed holder's lock frees itself at expiry. A zero or negative TTL is rejected with `ErrLockTTL` rather than taking a lock that would never expire.
-- Documented caveat (same as Laravel): `Clear` on the root cache wipes lock keys too.
+- `Clear` never touches lock keys, root cache included: locks are in their own key domain (§7), so clearing a cache cannot release a lock another process is holding.
 
 ## 12. Events
 

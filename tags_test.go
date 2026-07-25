@@ -75,7 +75,7 @@ func TestUnparseableTagTimestampDoesNotFailReads(t *testing.T) {
 	if err := Set(ctx, c, "u1", user{Name: "ana"}, WithTags("users")); err != nil {
 		t.Fatal(err)
 	}
-	if err := l1.Set(ctx, tagKey("users"), []byte("not-a-timestamp"), 0); err != nil {
+	if err := l1.Set(ctx, c.tagKey("users"), []byte("not-a-timestamp"), 0); err != nil {
 		t.Fatal(err)
 	}
 
