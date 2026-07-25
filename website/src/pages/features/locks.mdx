@@ -117,8 +117,11 @@ The [null driver](/drivers/null) stores nothing, so its set-if-absent always suc
 all. Disabling caching in a test is fine; disabling it somewhere that relies on locks is not.
 :::
 
-Note also that `Clear` on a root cache removes lock keys along with everything else, releasing any
-held locks. Another reason to [clear a namespace instead](/concepts/keys-and-namespaces).
+Lock keys live in their own domain — `gocache:1:l:<namespaced name>` — separate from cache data. A
+`Clear` on any cache, root included, only touches the data domain, so it does not release a lock
+another process is holding, and no application key or `Delete` can reach one. Locks end when their
+owner releases them or their TTL expires. See [Keys and
+namespaces](/concepts/keys-and-namespaces).
 
 ## What this is and is not
 

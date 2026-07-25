@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -24,9 +25,11 @@ func (jsonCodec) Unmarshal(data []byte, v any) error {
 }
 
 type config struct {
-	l1          Driver
-	l2          Driver
-	bus         Bus
+	l1               Driver
+	l2               Driver
+	bus              Bus
+	escapedKeyPrefix string
+
 	defaultTTL  time.Duration
 	grace       time.Duration
 	soft        time.Duration
@@ -41,6 +44,8 @@ type config struct {
 
 func defaultConfig() *config {
 	return &config{
+		escapedKeyPrefix: escapeSegment(defaultKeyPrefix),
+
 		defaultTTL:  30 * time.Minute,
 		tagCacheTTL: 10 * time.Second,
 		codec:       jsonCodec{},
@@ -104,6 +109,16 @@ func WithBus(b Bus) Option {
 			return errors.New("gocache: nil bus")
 		}
 		cfg.bus = b
+		return nil
+	}
+}
+
+func WithKeyPrefix(prefix string) Option {
+	return func(cfg *config) error {
+		if strings.TrimSpace(prefix) == "" {
+			return errors.New("gocache: key prefix must not be empty")
+		}
+		cfg.escapedKeyPrefix = escapeSegment(prefix)
 		return nil
 	}
 }

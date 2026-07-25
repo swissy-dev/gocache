@@ -95,7 +95,7 @@ func (c *Cache) handleBusMsg(ctx context.Context, msg []byte) {
 			c.logf("bus clear failed", "err", err)
 		}
 	case "tag":
-		if _, err := c.cfg.l1.Delete(ctx, tagKey(m.Tag)); err != nil {
+		if _, err := c.cfg.l1.Delete(ctx, c.tagKey(m.Tag)); err != nil {
 			c.logf("bus tag evict failed", "err", err)
 		}
 	}

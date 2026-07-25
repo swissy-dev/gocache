@@ -7,12 +7,6 @@ import (
 	"strconv"
 )
 
-const tagPrefix = "__gocache:tag:"
-
-func tagKey(tag string) string {
-	return tagPrefix + tag
-}
-
 func (c *Cache) parseTagTS(tag string, raw []byte) int64 {
 	if len(raw) == 0 {
 		return 0
@@ -33,7 +27,7 @@ func (c *Cache) authoritative() Driver {
 }
 
 func (c *Cache) tagInvalidatedAt(ctx context.Context, tag string) (int64, error) {
-	k := tagKey(tag)
+	k := c.tagKey(tag)
 	if c.cfg.l1 != nil {
 		raw, ok, err := c.cfg.l1.Get(ctx, k)
 		if err != nil {
@@ -83,7 +77,7 @@ func (c *Cache) DeleteByTag(ctx context.Context, tags ...string) error {
 	auth := c.authoritative()
 	var errs []error
 	for _, tag := range tags {
-		k := tagKey(tag)
+		k := c.tagKey(tag)
 		if err := auth.Set(ctx, k, raw, 0); err != nil {
 			errs = append(errs, fmt.Errorf("gocache: tag write %q: %w", tag, err))
 			continue

@@ -7,9 +7,9 @@ import (
 )
 
 type Cache struct {
-	cfg    *config
-	prefix string
-	rt     *runtime
+	cfg *config
+	ns  string
+	rt  *runtime
 }
 
 func New(opts ...Option) (*Cache, error) {
@@ -43,12 +43,8 @@ func New(opts ...Option) (*Cache, error) {
 
 func (c *Cache) Namespace(name string) *Cache {
 	nc := *c
-	nc.prefix = c.prefix + name + ":"
+	nc.ns = joinSegments(c.ns, escapeSegment(name))
 	return &nc
-}
-
-func (c *Cache) key(k string) string {
-	return c.prefix + k
 }
 
 func (c *Cache) callOpts(opts []CallOption) callOpts {
@@ -179,16 +175,17 @@ func (c *Cache) Clear(ctx context.Context) error {
 	if c.rt.closed.Load() {
 		return ErrClosed
 	}
+	prefix := c.scopedPrefix(domainData)
 	var errs []error
 	authOK := true
 	if c.cfg.l2 != nil {
-		if err := c.cfg.l2.ClearPrefix(ctx, c.prefix); err != nil {
+		if err := c.cfg.l2.ClearPrefix(ctx, prefix); err != nil {
 			errs = append(errs, fmt.Errorf("gocache: l2 clear: %w", err))
 			authOK = false
 		}
 	}
 	if c.cfg.l1 != nil {
-		if err := c.cfg.l1.ClearPrefix(ctx, c.prefix); err != nil {
+		if err := c.cfg.l1.ClearPrefix(ctx, prefix); err != nil {
 			errs = append(errs, fmt.Errorf("gocache: l1 clear: %w", err))
 			if c.cfg.l2 == nil {
 				authOK = false
@@ -197,10 +194,10 @@ func (c *Cache) Clear(ctx context.Context) error {
 	}
 	err := errors.Join(errs...)
 	if err == nil {
-		c.emit(EventCleared{Prefix: c.prefix})
+		c.emit(EventCleared{Prefix: prefix})
 	}
 	if authOK {
-		c.publish("clear", nil, c.prefix, "")
+		c.publish("clear", nil, prefix, "")
 	}
 	return err
 }

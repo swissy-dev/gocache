@@ -17,6 +17,21 @@ Passed to `gocache.New`.
 
 At least one tier is required.
 
+### Keys
+
+| Option | Default | Description |
+|---|---|---|
+| `WithKeyPrefix(s)` | `gocache` | Leading segment of every key this cache stores |
+
+Every stored key begins `<prefix>:1:<domain>:` — see [Keys and
+namespaces](/concepts/keys-and-namespaces). Changing the prefix lets two applications share one
+Redis logical database without seeing, overwriting or clearing each other's entries. It is escaped
+like any other segment, so a prefix containing `:` or `\` is unambiguous. An empty or
+whitespace-only prefix is rejected.
+
+Changing the prefix of a running cache orphans everything written under the old one: the old
+entries are unreachable and no longer cleared by `Clear`, and they expire on their own TTLs.
+
 ### Expiry
 
 | Option | Default | Description |
@@ -55,6 +70,7 @@ Soft timeouts require grace — there must be a stale value to return.
 - a zero tag-cache TTL
 - a bus retry queue size below 1
 - a codec whose output is not valid JSON
+- an empty or whitespace-only key prefix
 
 ## Call options
 

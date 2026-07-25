@@ -101,8 +101,11 @@ func TestNamespacePrefixes(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 	ns := c.Namespace("users").Namespace("posts")
-	if got := ns.key("1"); got != "users:posts:1" {
-		t.Fatalf("key = %q", got)
+	if got, want := ns.ns, "users:posts"; got != want {
+		t.Fatalf("namespace path = %q, want %q", got, want)
+	}
+	if got, want := ns.key("1"), ns.scopedPrefix(domainData)+"1"; got != want {
+		t.Fatalf("key = %q, want %q", got, want)
 	}
 }
 

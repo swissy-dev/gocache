@@ -41,16 +41,16 @@ func TestBusEvictsPeerL1OnSet(t *testing.T) {
 	if v, ok, _ := Get[user](ctx, b, "u"); !ok || v.Name != "v1" {
 		t.Fatalf("b read v=%+v ok=%v", v, ok)
 	}
-	if _, ok, _ := l1b.Get(ctx, "u"); !ok {
+	if _, ok, _ := l1b.Get(ctx, b.key("u")); !ok {
 		t.Fatal("b should have L1 copy after read")
 	}
 	if err := Set(ctx, a, "u", user{Name: "v2"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := l1a.Get(ctx, "u"); !ok {
+	if _, ok, _ := l1a.Get(ctx, a.key("u")); !ok {
 		t.Fatal("a must keep its own L1 write (origin filter)")
 	}
-	if _, ok, _ := l1b.Get(ctx, "u"); ok {
+	if _, ok, _ := l1b.Get(ctx, b.key("u")); ok {
 		t.Fatal("b's L1 must be evicted by the bus")
 	}
 	if v, ok, _ := Get[user](ctx, b, "u"); !ok || v.Name != "v2" {
@@ -70,7 +70,7 @@ func TestBusEvictsPeerL1OnDelete(t *testing.T) {
 	if _, err := a.Delete(ctx, "u"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := l1b.Get(ctx, "u"); ok {
+	if _, ok, _ := l1b.Get(ctx, b.key("u")); ok {
 		t.Fatal("b's L1 must be evicted")
 	}
 	if _, ok, _ := Get[user](ctx, b, "u"); ok {
@@ -108,7 +108,7 @@ func TestBusPropagatesClear(t *testing.T) {
 	if err := a.Clear(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := l1b.Get(ctx, "u"); ok {
+	if _, ok, _ := l1b.Get(ctx, b.key("u")); ok {
 		t.Fatal("b's L1 must be cleared")
 	}
 }
@@ -122,18 +122,18 @@ func TestClosedInstanceIgnoresPeerBusMessage(t *testing.T) {
 	if _, ok, _ := Get[user](ctx, b, "u"); !ok {
 		t.Fatal("warm b")
 	}
-	if _, ok, _ := l1b.Get(ctx, "u"); !ok {
+	if _, ok, _ := l1b.Get(ctx, b.key("u")); !ok {
 		t.Fatal("b should have L1 copy before close")
 	}
 	if err := b.Close(); err != nil {
 		t.Fatal(err)
 	}
-	msg, err := json.Marshal(busMsg{Origin: a.rt.origin, Op: "delete", Keys: []string{"u"}})
+	msg, err := json.Marshal(busMsg{Origin: a.rt.origin, Op: "delete", Keys: []string{a.key("u")}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	b.handleBusMsg(ctx, msg)
-	if _, ok, _ := l1b.Get(ctx, "u"); !ok {
+	if _, ok, _ := l1b.Get(ctx, b.key("u")); !ok {
 		t.Fatal("closed instance must not evict its L1 for a peer's bus message")
 	}
 }

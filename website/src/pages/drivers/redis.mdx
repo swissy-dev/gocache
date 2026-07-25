@@ -50,24 +50,21 @@ metacharacters, so a key containing `*` cannot widen the match and delete unrela
 
 ## Clearing
 
-:::danger[Clear on a root cache is effectively FLUSHDB]
-Prefix clearing with an empty prefix becomes `SCAN MATCH *` plus `DEL` — and a root cache has an
-empty prefix. `cache.Clear(ctx)` on a root cache deletes **every key in the selected logical
-database**, including keys gocache never wrote: your sessions, queues, rate limiters, everything.
+`Clear` never reaches the driver with an empty prefix. gocache clears its own data domain — `SCAN
+MATCH gocache:1:d:*` plus `DEL` on a root cache, or `gocache:1:d:<namespace>:*` inside a namespace —
+so a root `Clear` on a database shared with sessions, queues or rate limiters leaves those alone.
+See [Keys and namespaces](/concepts/keys-and-namespaces) for the layout and for what a root `Clear`
+deliberately does not touch.
 
-Two ways to make this safe, and you want at least one:
+`SCAN` gives no snapshot guarantee: keys written while a clear is running may or may not be removed.
+It is a best-effort bulk delete, not a transaction.
+
+Giving the cache its own logical database is still reasonable for operational tidiness, and
+[`WithKeyPrefix`](/reference/options) separates two applications that must share one:
 
 ```go
-// Scope the clear to a namespace.
-err := cache.Namespace("cache").Clear(ctx)
-
-// Or give the cache its own logical database.
 client := redis.NewClient(&redis.Options{Addr: "localhost:6379", DB: 1})
 ```
-:::
-
-`SCAN` also gives no snapshot guarantee: keys written while a clear is running may or may not be
-removed. It is a best-effort bulk delete, not a transaction.
 
 ## Expiry and eviction
 
