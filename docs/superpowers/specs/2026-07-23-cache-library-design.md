@@ -205,6 +205,17 @@ Every cache entry is stored as JSON:
 
 L1 hit and logically fresh → return. Else L2: fresh → backfill L1 (physical TTL recomputed as remaining logical TTL + configured grace) → return. Else miss. When L1 held a stale entry and L2 reports absent, that stale envelope is carried out of the read as a grace candidate — `Get` still treats it as a miss, but `GetOrSet` can serve it under grace. `Get` never returns stale values. `Pull` is `Get` followed by delete-through (both tiers + bus) and shares its signature.
 
+#### 6b. Backfill fencing
+
+Reading L2 and writing L1 are separate steps. A mutation completing between them would otherwise be undone: the backfill writes the pre-mutation value into L1 *after* the invalidation, and that resurrected copy is served until its physical TTL expires — never, for an entry written with no expiry. Both the data backfill and the L1 tag-marker cache (§7) go through this shape and are fenced identically.
+
+- **Tracker.** A fixed-size array of 4 096 striped `atomic.Uint64` counters on the cache runtime, indexed by `maphash.String(seed, fullKey) % 4096`. Bounded by construction: an unbounded per-key map would be a memory-growth DoS in its own right. Two keys sharing a stripe cause a *skipped* backfill, never a stale write — the next read simply repeats the L2 fetch.
+- **Bump before mutate.** Every local mutation path increments its keys' stripes *before* touching any tier: `writeEnvelope`, `Delete`, `DeleteMany`, `DeleteByTag` (on the tag's marker key), and the inbound bus handler for `delete` / `clear` / `tag`. `Clear` invalidates a whole prefix, which no per-key stripe can express, so local and inbound clears bump *every* stripe; clears are rare and 4 096 atomic adds are cheap.
+- **Check, write, re-check.** The reader loads the generation before the L2 read and, after it, (1) skips the backfill outright if the generation moved, (2) otherwise writes L1, then (3) re-loads the generation and deletes the key from L1 if it moved during the write.
+- **Why the ordering is sound.** Step 1 alone is not enough — a mutation can land between the check and the L1 write. The re-check closes it: a mutator bumps before its own L1 eviction, so if the backfill's write landed after that eviction (the only ordering that resurrects anything), the mutator's bump precedes the reader's re-load and the reader deletes what it just wrote. The residual case — the re-check firing against a *newer* value written by a concurrent `Set` — evicts a live L1 entry, which is a wasted repopulation, not stale data.
+
+
+
 ### GetOrSet
 
 1. Fast path: fresh hit in L1/L2 → return.
@@ -227,6 +238,8 @@ Flights are **owned by the cache, not by any caller** — this avoids the classi
 ### Set / Delete / DeleteMany / Clear
 
 Write-through or delete-through: L2 first, then L1, then bus publish. `Clear` = `ClearPrefix` of the current namespace's data-domain prefix (§7) on both tiers + bus broadcast; it is never called with an empty prefix.
+
+**Publishing on failure is asymmetric (§8).** The delete-shaped paths — `Delete`, `DeleteMany`, `Clear`, `DeleteByTag` — publish for every key they attempted and *then* return the tier error. `Set` publishes only when the authoritative write succeeded.
 
 ## 7. Key layout, tags and namespaces
 
@@ -275,9 +288,10 @@ One channel (default `gocache:bus`, configurable). JSON messages:
 ```
 
 - Each instance generates a random origin ID at startup and ignores its own messages.
-- On receipt: `delete` evicts the listed keys from L1; `clear` prefix-evicts L1; `tag` evicts the cached tag-timestamp key so the next read refetches it. L2 is never touched — it is already correct.
+- On receipt: `delete` evicts the listed keys from L1; `clear` prefix-evicts L1; `tag` evicts the cached tag-timestamp key so the next read refetches it. L2 is never touched — it is already correct. Each case first bumps the corresponding invalidation stripes (§6b) — every stripe for `clear` — so an L2 read already in flight on the receiver cannot backfill the value the message just invalidated.
 - `k` and `p` carry fully-encoded keys and prefixes (§7); `t` carries the raw tag name and the receiver applies its own prefix. Two caches with different `WithKeyPrefix` values sharing one bus channel therefore exchange inert `delete`/`clear` messages, and a `tag` message only makes the peer refetch its own tag marker — correct, if mildly wasteful. Give them separate channels if that matters.
 - Set operations publish a `delete` for the written keys (peers drop stale L1 copies and re-read from L2 on demand).
+- **Delete-shaped operations publish unconditionally.** `Delete`, `DeleteMany`, `Clear` and `DeleteByTag` publish for every key/prefix/tag they attempted *before* returning any tier error. Drivers mutate in chunks, so a later chunk failing leaves earlier ones committed, and an ambiguous network error may hide a delete that landed; gating the publish on success would leave peers serving L1 copies of entries whose authoritative rows are gone, unbounded for entries with no expiry. Over-publishing costs one message plus a peer re-read that finds the value still present. `Set` is the deliberate exception — a rejected authoritative write changed nothing, so publishing could only trigger pointless re-reads, and it stays gated on success.
 - **Publish failures are asynchronous by design** (§9 exception): they go to a bounded in-memory retry queue (default 1 024 messages, `WithBusRetryQueueSize`) drained with backoff by a cache-owned goroutine that exits via the lifecycle context and is joined by `Close`. On overflow the oldest message is dropped and `EventBusPublishFailed` fires per drop; messages still queued at `Close` are dropped (staleness stays bounded by L1 logical TTLs). Worst case with the bus fully down: peers serve their L1 copy until its logical TTL expires.
 
 ## 9. Error handling

@@ -53,6 +53,32 @@ reconciling a local tier against a shared one:
 You can reuse the same Redis client for the driver and the bus, as above. gocache never closes a
 client you hand it.
 
+## Publishing when a delete fails
+
+`Delete`, `DeleteMany`, `Clear` and `DeleteByTag` publish their invalidation for **every key they
+attempted**, then return whatever error the tiers produced. The publish is not conditional on the
+delete having succeeded.
+
+That is deliberate, and it is the opposite of what `Set` does. A delete is rarely all-or-nothing: the
+Redis and SQL drivers mutate in chunks, so an error on the third chunk leaves the first two already
+committed, and an ambiguous network error means the delete may well have landed. If the publish were
+suppressed in those cases, peers would keep serving L1 copies of entries whose authoritative rows are
+already gone — indefinitely, for an entry with no expiry.
+
+The two failure modes are not symmetric:
+
+- **Publishing when nothing changed** costs one message and a re-read per peer. The peer drops its
+  local copy, goes to L2, and finds the value still there.
+- **Not publishing when something did change** serves stale data until the TTL expires, and there is
+  no signal that it is happening.
+
+So the delete paths take the cheap failure. `Set` does not: if the authoritative write failed then
+nothing changed, and the only thing a publish could achieve is making every peer re-read a value that
+is still current — so `Set` keeps its publish gated on the write succeeding.
+
+An error returned from a delete therefore means "this may not have fully applied — retry it", not
+"the peers were left uninformed".
+
 ## What it costs
 
 One Redis Pub/Sub message per write, delete, clear or tag invalidation, and one subscriber goroutine

@@ -40,6 +40,7 @@ func (c *Cache) tagInvalidatedAt(ctx context.Context, tag string) (int64, error)
 	if c.cfg.l2 == nil {
 		return 0, nil
 	}
+	gen := c.rt.fence.generation(k)
 	raw, ok, err := c.cfg.l2.Get(ctx, k)
 	if err != nil {
 		return 0, fmt.Errorf("gocache: l2 tag read: %w", err)
@@ -48,7 +49,7 @@ func (c *Cache) tagInvalidatedAt(ctx context.Context, tag string) (int64, error)
 		raw = []byte("0")
 	}
 	if c.cfg.l1 != nil {
-		if err := c.cfg.l1.Set(ctx, k, raw, c.cfg.tagCacheTTL); err != nil {
+		if err := c.fencedL1Set(ctx, k, raw, c.cfg.tagCacheTTL, gen); err != nil {
 			c.logf("l1 tag cache failed", "tag", tag, "err", err)
 		}
 	}
@@ -78,16 +79,17 @@ func (c *Cache) DeleteByTag(ctx context.Context, tags ...string) error {
 	var errs []error
 	for _, tag := range tags {
 		k := c.tagKey(tag)
+		c.rt.fence.invalidate(k)
 		if err := auth.Set(ctx, k, raw, 0); err != nil {
 			errs = append(errs, fmt.Errorf("gocache: tag write %q: %w", tag, err))
-			continue
-		}
-		if c.cfg.l1 != nil && c.cfg.l2 != nil {
-			if err := c.cfg.l1.Set(ctx, k, raw, c.cfg.tagCacheTTL); err != nil {
-				c.logf("l1 tag cache failed", "tag", tag, "err", err)
+		} else {
+			if c.cfg.l1 != nil && c.cfg.l2 != nil {
+				if err := c.cfg.l1.Set(ctx, k, raw, c.cfg.tagCacheTTL); err != nil {
+					c.logf("l1 tag cache failed", "tag", tag, "err", err)
+				}
 			}
+			c.emit(EventTagInvalidated{Tag: tag})
 		}
-		c.emit(EventTagInvalidated{Tag: tag})
 		c.publish("tag", nil, "", tag)
 	}
 	return errors.Join(errs...)

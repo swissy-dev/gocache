@@ -313,6 +313,12 @@ func (b *countingBus) count() int {
 	return len(b.msgs)
 }
 
+func (b *countingBus) messages() [][]byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.msgs)
+}
+
 func TestSetPublishesWhenOnlyTheL1WriteFails(t *testing.T) {
 	bus := &countingBus{}
 	l2 := memory.New()

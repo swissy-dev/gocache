@@ -24,6 +24,7 @@ type runtime struct {
 	sf        singleflight.Group
 	origin    string
 	retryQ    chan []byte
+	fence     invalidationFence
 }
 
 func (rt *runtime) track() bool {
@@ -87,15 +88,19 @@ func (c *Cache) handleBusMsg(ctx context.Context, msg []byte) {
 	}
 	switch m.Op {
 	case "delete":
+		c.rt.fence.invalidateMany(m.Keys)
 		if err := c.cfg.l1.DeleteMany(ctx, m.Keys); err != nil {
 			c.logf("bus delete failed", "err", err)
 		}
 	case "clear":
+		c.rt.fence.invalidateEverything()
 		if err := c.cfg.l1.ClearPrefix(ctx, m.Prefix); err != nil {
 			c.logf("bus clear failed", "err", err)
 		}
 	case "tag":
-		if _, err := c.cfg.l1.Delete(ctx, c.tagKey(m.Tag)); err != nil {
+		markerKey := c.tagKey(m.Tag)
+		c.rt.fence.invalidate(markerKey)
+		if _, err := c.cfg.l1.Delete(ctx, markerKey); err != nil {
 			c.logf("bus tag evict failed", "err", err)
 		}
 	}

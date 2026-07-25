@@ -101,15 +101,14 @@ func (c *Cache) Delete(ctx context.Context, key string) (bool, error) {
 		return false, ErrClosed
 	}
 	k := c.key(key)
+	c.rt.fence.invalidate(k)
 	var existed bool
 	var errs []error
-	authOK := true
 	if c.cfg.l2 != nil {
 		ok, err := c.cfg.l2.Delete(ctx, k)
 		existed = existed || ok
 		if err != nil {
 			errs = append(errs, fmt.Errorf("gocache: l2 delete: %w", err))
-			authOK = false
 		}
 	}
 	if c.cfg.l1 != nil {
@@ -117,18 +116,13 @@ func (c *Cache) Delete(ctx context.Context, key string) (bool, error) {
 		existed = existed || ok
 		if err != nil {
 			errs = append(errs, fmt.Errorf("gocache: l1 delete: %w", err))
-			if c.cfg.l2 == nil {
-				authOK = false
-			}
 		}
 	}
 	err := errors.Join(errs...)
 	if err == nil {
 		c.emit(EventDeleted{Key: k})
 	}
-	if authOK {
-		c.publish("delete", []string{k}, "", "")
-	}
+	c.publish("delete", []string{k}, "", "")
 	if err != nil {
 		return false, err
 	}
@@ -143,20 +137,16 @@ func (c *Cache) DeleteMany(ctx context.Context, keys []string) error {
 	for i, k := range keys {
 		full[i] = c.key(k)
 	}
+	c.rt.fence.invalidateMany(full)
 	var errs []error
-	authOK := true
 	if c.cfg.l2 != nil {
 		if err := c.cfg.l2.DeleteMany(ctx, full); err != nil {
 			errs = append(errs, fmt.Errorf("gocache: l2 delete many: %w", err))
-			authOK = false
 		}
 	}
 	if c.cfg.l1 != nil {
 		if err := c.cfg.l1.DeleteMany(ctx, full); err != nil {
 			errs = append(errs, fmt.Errorf("gocache: l1 delete many: %w", err))
-			if c.cfg.l2 == nil {
-				authOK = false
-			}
 		}
 	}
 	err := errors.Join(errs...)
@@ -165,9 +155,7 @@ func (c *Cache) DeleteMany(ctx context.Context, keys []string) error {
 			c.emit(EventDeleted{Key: k})
 		}
 	}
-	if authOK {
-		c.publish("delete", full, "", "")
-	}
+	c.publish("delete", full, "", "")
 	return err
 }
 
@@ -176,28 +164,22 @@ func (c *Cache) Clear(ctx context.Context) error {
 		return ErrClosed
 	}
 	prefix := c.scopedPrefix(domainData)
+	c.rt.fence.invalidateEverything()
 	var errs []error
-	authOK := true
 	if c.cfg.l2 != nil {
 		if err := c.cfg.l2.ClearPrefix(ctx, prefix); err != nil {
 			errs = append(errs, fmt.Errorf("gocache: l2 clear: %w", err))
-			authOK = false
 		}
 	}
 	if c.cfg.l1 != nil {
 		if err := c.cfg.l1.ClearPrefix(ctx, prefix); err != nil {
 			errs = append(errs, fmt.Errorf("gocache: l1 clear: %w", err))
-			if c.cfg.l2 == nil {
-				authOK = false
-			}
 		}
 	}
 	err := errors.Join(errs...)
 	if err == nil {
 		c.emit(EventCleared{Prefix: prefix})
 	}
-	if authOK {
-		c.publish("clear", nil, prefix, "")
-	}
+	c.publish("clear", nil, prefix, "")
 	return err
 }

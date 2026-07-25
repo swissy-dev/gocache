@@ -80,8 +80,8 @@ Everything else is returned.
 
 **`Get`** — `(zero, false, err)` when a tier is unreachable or a value cannot be decoded.
 
-**`Set`** — returns tier failures. L2 failing aborts the write; L1 failing after L2 succeeded still
-returns an error, but the bus publish happens anyway.
+**`Set`** — returns tier failures. L2 failing aborts the write and publishes nothing, since nothing
+changed; L1 failing after L2 succeeded still returns an error, but the bus publish happens anyway.
 
 **`GetOrSet`** — returns the wrapped factory error when the factory fails and grace does not cover
 it. A panicking factory becomes an error too, delivered to every waiting caller.
@@ -92,6 +92,18 @@ describe both tiers.
 **`DeleteByTag`** — narrower: it writes only the authoritative tier (L2 when configured, otherwise
 L1) and joins the per-*tag* errors from that write. The best-effort copy it keeps in L1's tag cache
 is not part of the returned error — if that write fails, it is logged, not returned.
+
+:::warning[A failed delete still publishes]
+`Delete`, `DeleteMany`, `Clear` and `DeleteByTag` publish their bus invalidation for every key they
+attempted *before* returning an error. An error from these does not mean peers were left uninformed —
+it means the mutation may not have applied everywhere and is worth retrying.
+
+Drivers delete in chunks, so a later chunk failing does not un-delete the earlier ones, and an
+ambiguous network error may hide a delete that landed. Publishing anyway costs a redundant re-read;
+staying quiet would leave peers serving stale L1 copies until their TTL expires. `Set` is the
+exception and publishes only on success — see
+[Running multiple instances](/guides/running-multiple-instances#publishing-when-a-delete-fails).
+:::
 
 **Lock methods** — return driver errors wrapped. `Release` returns nil when nothing is held or when
 the owner token no longer matches, since both are legitimate outcomes rather than failures.

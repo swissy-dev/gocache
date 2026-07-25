@@ -22,6 +22,21 @@ changed" — it never carries data, so messages stay small and out-of-order deli
 A message is published on every write, delete, clear and tag invalidation. On receipt, a peer
 evicts from **L1 only**; L2 is already correct, having been written first.
 
+A peer that receives an invalidation also fences any backfill it currently has in flight for those
+keys, so a read that was already talking to L2 when the message arrived cannot repopulate L1 with the
+value the message just invalidated. See [Tiers](/concepts/tiers#the-read-path).
+
+## Publishing on partial failure
+
+`Delete`, `DeleteMany`, `Clear` and `DeleteByTag` publish for every key they attempted even when the
+authoritative tier returns an error, then return that error. Drivers mutate in chunks and network
+errors are ambiguous, so a failed delete may still have applied — and an unpublished invalidation
+leaves peers serving stale L1 copies indefinitely, while a redundant one costs a single re-read.
+
+`Set` is deliberately the exception: a write that the authoritative tier rejected changed nothing, so
+it publishes only on success. Full reasoning in
+[Running multiple instances](/guides/running-multiple-instances#publishing-when-a-delete-fails).
+
 Each instance generates a random origin ID at startup and stamps its messages with it, then ignores
 anything carrying its own. That is what lets the writer keep the copy it just wrote while every peer
 drops theirs.
