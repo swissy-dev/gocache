@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/swissy-dev/gocache"
 	"github.com/swissy-dev/gocache/driver/drivertest"
@@ -51,5 +52,44 @@ func TestLRUEviction(t *testing.T) {
 	}
 	if _, ok, _ := d.Get(ctx, "c"); !ok {
 		t.Fatal("c should survive")
+	}
+}
+
+func TestEvictionPrefersExpiredEntries(t *testing.T) {
+	d := New(WithMaxEntries(3))
+	ctx := context.Background()
+
+	set := func(k string, ttl time.Duration) {
+		t.Helper()
+		if err := d.Set(ctx, k, []byte(k), ttl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	held := func(k string) bool {
+		t.Helper()
+		_, ok, err := d.Get(ctx, k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+
+	set("live-old", time.Hour)
+	set("expired", 20*time.Millisecond)
+	set("live-new", time.Hour)
+	time.Sleep(50 * time.Millisecond)
+
+	set("live-c", time.Hour)
+
+	if !held("live-old") {
+		t.Fatal("evicted the least-recently-used live entry while an expired one was still held")
+	}
+	if held("expired") {
+		t.Fatal("the expired entry should have been reclaimed")
+	}
+	for _, k := range []string{"live-new", "live-c"} {
+		if !held(k) {
+			t.Fatalf("%s should still be cached", k)
+		}
 	}
 }
