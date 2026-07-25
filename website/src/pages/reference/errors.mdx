@@ -27,6 +27,7 @@ tier, a decode failure — not that the key was missing.
 | Error | Meaning |
 |---|---|
 | `ErrClosed` | The cache has been closed |
+| `ErrFactoryLimit` | A flight hit its hard timeout waiting for a [factory slot](/features/get-or-set) |
 | `ErrLockHeld` | `Lock.Do` found the lock already taken |
 | `ErrLockTimeout` | `Lock.Block` gave up waiting |
 | `ErrLockTTL` | A lock was created with a zero or negative TTL |

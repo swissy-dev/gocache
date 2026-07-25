@@ -45,9 +45,22 @@ entries are unreachable and no longer cleared by `Clear`, and they expire on the
 | Option | Default | Description |
 |---|---|---|
 | `WithSoftTimeout(d)` | off | Return a stale value after this long, leaving the factory running |
-| `WithHardTimeout(d)` | off | Cancel the factory's context after this long |
+| `WithHardTimeout(d)` | 30 seconds | Cancel the flight's context after this long; `0` means no bound |
 
 Soft timeouts require grace — there must be a stale value to return.
+
+The hard timeout is the one option that defaults to *on*, so that an unconfigured cache cannot run a
+factory forever. Zero is an explicit "no bound", not the unset state.
+
+### Concurrency
+
+| Option | Default | Description |
+|---|---|---|
+| `WithMaxConcurrentFactories(n)` | 1024 | Ceiling on factories executing at once; below 1 is rejected |
+
+The slot belongs to the flight, so callers sharing a key share one slot. Past the ceiling a new
+flight waits for a slot rather than failing; see [Cache-aside and
+stampedes](/features/get-or-set#how-much-work-can-be-in-flight-at-once).
 
 ### Behaviour
 
@@ -69,6 +82,7 @@ Soft timeouts require grace — there must be a stale value to return.
 - a negative duration on any option
 - a zero tag-cache TTL
 - a bus retry queue size below 1
+- a factory concurrency limit below 1
 - a codec whose output is not valid JSON
 - an empty or whitespace-only key prefix
 
@@ -103,6 +117,10 @@ lifetime. Asking for more grace than the entry was written with will not find an
 
 **`WithTags`** — replaces rather than appends. All tags for an entry go in one call.
 
+**`WithHardTimeout` / `WithCallHardTimeout`** — zero disables the bound, at the cache or for one
+call. Since the default is a real 30 seconds rather than zero, passing zero is a deliberate "run
+without a ceiling", not the absence of a setting. Negative durations are still rejected.
+
 ## A worked configuration
 
 ```go
@@ -115,6 +133,7 @@ cache, err := gocache.New(
 	gocache.WithDefaultGrace(time.Hour),
 	gocache.WithSoftTimeout(150*time.Millisecond),
 	gocache.WithHardTimeout(10*time.Second),
+	gocache.WithMaxConcurrentFactories(200),
 
 	gocache.WithEventHook(hook),
 	gocache.WithLogger(logger),
@@ -123,4 +142,5 @@ cache, err := gocache.New(
 
 Read that as: cache locally and share via Redis; entries are good for five minutes and servable for
 an hour after that if the origin fails; do not make anyone wait longer than 150 ms when there is
-something stale to return; give up on a factory after ten seconds.
+something stale to return; give up on a factory after ten seconds; and never point more than 200
+factories at the database at once.

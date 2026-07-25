@@ -24,34 +24,42 @@ func (jsonCodec) Unmarshal(data []byte, v any) error {
 	return json.Unmarshal(data, v)
 }
 
+const (
+	defaultHardTimeout  = 30 * time.Second
+	defaultMaxFactories = 1024
+)
+
 type config struct {
 	l1               Driver
 	l2               Driver
 	bus              Bus
 	escapedKeyPrefix string
 
-	defaultTTL  time.Duration
-	grace       time.Duration
-	soft        time.Duration
-	hard        time.Duration
-	tagCacheTTL time.Duration
-	codec       Codec
-	clock       func() time.Time
-	hook        func(Event)
-	logger      *slog.Logger
-	busQueue    int
+	defaultTTL   time.Duration
+	grace        time.Duration
+	soft         time.Duration
+	hard         time.Duration
+	tagCacheTTL  time.Duration
+	codec        Codec
+	clock        func() time.Time
+	hook         func(Event)
+	logger       *slog.Logger
+	busQueue     int
+	maxFactories int
 }
 
 func defaultConfig() *config {
 	return &config{
 		escapedKeyPrefix: escapeSegment(defaultKeyPrefix),
 
-		defaultTTL:  30 * time.Minute,
-		tagCacheTTL: 10 * time.Second,
-		codec:       jsonCodec{},
-		clock:       time.Now,
-		logger:      slog.Default(),
-		busQueue:    1024,
+		defaultTTL:   30 * time.Minute,
+		hard:         defaultHardTimeout,
+		tagCacheTTL:  10 * time.Second,
+		codec:        jsonCodec{},
+		clock:        time.Now,
+		logger:       slog.Default(),
+		busQueue:     1024,
+		maxFactories: defaultMaxFactories,
 	}
 }
 
@@ -189,6 +197,16 @@ func WithEventHook(hook func(Event)) Option {
 func WithLogger(l *slog.Logger) Option {
 	return func(cfg *config) error {
 		cfg.logger = l
+		return nil
+	}
+}
+
+func WithMaxConcurrentFactories(n int) Option {
+	return func(cfg *config) error {
+		if n < 1 {
+			return errors.New("gocache: max concurrent factories must be positive")
+		}
+		cfg.maxFactories = n
 		return nil
 	}
 }

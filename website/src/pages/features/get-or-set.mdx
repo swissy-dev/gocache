@@ -70,6 +70,46 @@ may belong to a different request than the one you are serving.
 Pass anything the factory needs through the closure instead of pulling it out of the context.
 :::
 
+## How much work can be in flight at once
+
+Deduplication protects one key. It does nothing about *many* keys: a thousand distinct cold keys
+mean a thousand flights, each holding a goroutine and a backend connection. That is the same
+stampede in a different shape, and attacker-chosen keys make it trivial to trigger.
+
+So the number of factories running at once is bounded:
+
+```go
+gocache.WithMaxConcurrentFactories(200)   // default 1024
+```
+
+The slot is taken by the **flight**, not by the caller. Fifty callers waiting on one key still cost
+one slot between them — the bound is on how much work your backend sees, not on how many goroutines
+are waiting for an answer.
+
+When every slot is taken, a new flight **waits** for one rather than failing. That is deliberate:
+returning an error the moment a cache gets busy would push every one of those callers into whatever
+fallback they have — usually straight to the database the cache exists to protect. Waiting gives you
+backpressure instead, and nobody waits blindly:
+
+- Your own `ctx` deadline still applies. A caller whose context expires while its flight is queued
+  gets `context.Canceled` or `context.DeadlineExceeded`, exactly as it would have while waiting for
+  a slow factory.
+- The [soft timeout](/features/timeouts) still fires. With grace configured, a saturated cache
+  serves the stale value immediately and lets the queued refresh happen later.
+- The [hard timeout](/features/timeouts) bounds the queueing too. A flight that never gets a slot
+  fails with `ErrFactoryLimit` at the deadline, which grace catches like any other factory failure.
+
+Set it near the concurrency your backend can actually absorb — a connection pool size is a good
+anchor. The default of 1024 is meant to stop unbounded growth without throttling anything
+reasonable.
+
+:::info[What it does not bound]
+The bound is on factory *executions*. A flood of distinct keys still creates one queued flight
+goroutine per key; those hold no backend connection and live no longer than the hard timeout, but
+they are not free. If unique-key floods are part of your threat model, rate-limit ahead of the
+cache too.
+:::
+
 ## Errors
 
 If the factory fails, the error comes back wrapped, and the failure is not cached — the next caller
