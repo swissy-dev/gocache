@@ -69,6 +69,19 @@ Two properties follow:
 process is local. The backfilled entry keeps the remaining logical TTL of the original — it does not
 get a fresh lease on life.
 
+A backfill is *fenced* against invalidations that land while the L2 read is in flight. Reading L2 and
+writing L1 are two steps, and a `Set`, `Delete`, `DeleteMany`, `Clear`, `DeleteByTag` or an inbound
+bus message can complete between them; without the fence the backfill would write the pre-delete
+value back into L1 *after* the delete, and that resurrected copy would be served until its TTL
+expired — forever for an entry written with no expiry. gocache stamps every key with a mutation
+generation before it reads L2 and drops the backfill if the generation moved, so a raced read simply
+does not populate L1 and the next read repeats the L2 fetch. The same fence guards the short-lived
+L1 copy of a [tag](/features/tags) marker.
+
+The generation table is a fixed-size array of striped counters, so it costs the same memory whatever
+your key space looks like. Two keys can share a stripe, in which case a mutation to one can cancel an
+in-flight backfill of the other — a wasted L1 population, never a stale one.
+
 **L2 is authoritative.** If L1 holds a stale entry and L2 has none, the answer is still a miss —
 gocache will not serve a local copy as though it were fresh. The stale envelope is kept as a
 fallback candidate, though, so [grace](/features/grace-periods) can use it if the factory then
@@ -89,11 +102,15 @@ Set(key, value)
   └─ publish invalidation on the bus
 ```
 
-If L2 fails, the write returns that error and L1 is left alone — better a local miss than a local
-copy of something the shared tier never accepted.
+If L2 fails, the write returns that error, L1 is left alone, and **no invalidation is published** —
+nothing changed, so making every peer re-read would be pure waste.
 
 If L1 fails after L2 succeeded, the write returns the error but the bus publish still happens,
 because the shared tier really did change and peers need to know.
+
+The delete-shaped paths — `Delete`, `DeleteMany`, `Clear`, `DeleteByTag` — invert that reasoning and
+publish for every key they attempted, even when the authoritative tier returns an error. See
+[Running multiple instances](/guides/running-multiple-instances#publishing-when-a-delete-fails).
 
 ## Skipping a tier for one call
 

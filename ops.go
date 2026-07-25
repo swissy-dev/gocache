@@ -53,6 +53,7 @@ func (c *Cache) read(ctx context.Context, fullKey string) (readResult, error) {
 		}
 	}
 	if c.cfg.l2 != nil {
+		gen := c.rt.fence.generation(fullKey)
 		env, ok, err := c.readTier(ctx, c.cfg.l2, fullKey)
 		if err != nil {
 			return readResult{}, err
@@ -61,7 +62,7 @@ func (c *Cache) read(ctx context.Context, fullKey string) (readResult, error) {
 			return staleL1, nil
 		}
 		if env.fresh(now) {
-			c.backfillL1(ctx, fullKey, env, now)
+			c.backfillL1(ctx, fullKey, env, now, gen)
 			return readResult{env: env, found: true, fresh: true, tier: TierL2}, nil
 		}
 		return readResult{env: env, found: true, tier: TierL2}, nil
@@ -69,7 +70,7 @@ func (c *Cache) read(ctx context.Context, fullKey string) (readResult, error) {
 	return readResult{}, nil
 }
 
-func (c *Cache) backfillL1(ctx context.Context, fullKey string, env envelope, now time.Time) {
+func (c *Cache) backfillL1(ctx context.Context, fullKey string, env envelope, now time.Time, gen uint64) {
 	if c.cfg.l1 == nil {
 		return
 	}
@@ -82,7 +83,7 @@ func (c *Cache) backfillL1(ctx context.Context, fullKey string, env envelope, no
 	if ttl < 0 {
 		return
 	}
-	if err := c.cfg.l1.Set(ctx, fullKey, raw, ttl); err != nil {
+	if err := c.fencedL1Set(ctx, fullKey, raw, ttl, gen); err != nil {
 		c.logf("l1 backfill failed", "key", fullKey, "err", err)
 	}
 }
@@ -103,6 +104,7 @@ func (c *Cache) writeEnvelope(ctx context.Context, fullKey string, env envelope,
 	if err != nil {
 		return fmt.Errorf("gocache: encode envelope: %w", err)
 	}
+	c.rt.fence.invalidate(fullKey)
 	ttl := physicalTTL(env, c.cfg.clock(), o.grace)
 	if env.ExpiresAt != 0 && ttl <= 0 {
 		ttl = time.Millisecond
