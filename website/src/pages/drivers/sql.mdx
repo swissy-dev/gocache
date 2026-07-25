@@ -1,0 +1,151 @@
+# SQL driver
+
+Caches into a table in your existing database. Postgres, MySQL and SQLite are supported from one
+implementation.
+
+```go
+import (
+	"database/sql"
+
+	"github.com/swissy-dev/gocache"
+	"github.com/swissy-dev/gocache/driver/memory"
+	sqldriver "github.com/swissy-dev/gocache/driver/sqldriver"
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+db, err := sql.Open("pgx", dsn)
+if err != nil {
+	return err
+}
+
+store, err := sqldriver.New(db, sqldriver.Postgres)
+if err != nil {
+	return err
+}
+
+cache, err := gocache.New(
+	gocache.WithL1(memory.New()),
+	gocache.WithL2(store),
+)
+```
+
+The appeal is having no new infrastructure: your database is already deployed, backed up and
+monitored. The cost is latency and load on the system you are usually caching to protect — so this
+is a good fit for a modest cache, and a poor one for a very hot path.
+
+Dialects are `sqldriver.Postgres`, `sqldriver.MySQL` and `sqldriver.SQLite`. They differ in more than
+placeholder style — upsert syntax, insert-if-absent, `LIKE` escaping and the batched sweep statement
+all vary — so pass the one matching your database.
+
+## The table
+
+Schema creation is never implicit. Get the DDL and run it through your own migration tooling:
+
+```go
+for _, stmt := range store.Schema() {
+	fmt.Println(stmt)
+}
+```
+
+`Schema()` returns statements for the configured dialect and table name: a `CREATE TABLE IF NOT
+EXISTS`, plus an index on the expiry column so the sweeper's deletes and the freshness filter on
+reads are not full scans. All three dialects index it; only the shape differs — Postgres and SQLite
+get a separate `CREATE INDEX IF NOT EXISTS` statement, while MySQL declares its index inline in the
+`CREATE TABLE`, so `Schema()` returns one statement for MySQL and two for the other dialects.
+
+In development, `store.Migrate(ctx)` executes them for you. Do not run it in production — DDL rights
+on the application's database user is exactly the privilege you do not want, and it bypasses the
+migration history your team relies on.
+
+The table holds a key, a value and a nullable expiry in unix milliseconds. Default name `gocache`,
+changeable with `WithTable`. The name is validated against a strict identifier pattern and rejected
+otherwise — every value is parameterised, and the table name is the only identifier interpolated
+into SQL.
+
+:::warning[MySQL limits keys to 255 bytes]
+On MySQL the key column is `VARBINARY(255)`, chosen for exact byte comparison. Longer keys will not
+round-trip.
+
+Postgres uses `TEXT`, but the key is a btree primary key, so entries are capped at roughly 2704
+bytes on a default 8 KB page — much higher, not unlimited. SQLite has no practical limit.
+:::
+
+There is no schema version marker, so a future change to the table layout has no automatic upgrade
+path. You would migrate it yourself.
+
+## The connection pool is yours
+
+The driver never calls `SetMaxOpenConns`, `SetMaxIdleConns`, `SetConnMaxLifetime` or
+`SetConnMaxIdleTime`, and its `Close` stops the sweeper without closing your `*sql.DB`.
+
+Configure the pool yourself, and remember cache traffic is additional load on it:
+
+```go
+db.SetMaxOpenConns(25)
+db.SetMaxIdleConns(10)
+db.SetConnMaxLifetime(time.Hour)
+```
+
+If the cache and your application share a pool, a cache-induced spike can starve your real queries.
+A separate `*sql.DB` for the cache is worth considering when traffic is significant.
+
+## Expiry and the sweeper
+
+Expired rows are filtered on read, so a stale row is never served. But unlike Redis, nothing removes
+them on its own — hence the sweeper.
+
+A background goroutine deletes expired rows in bounded batches, every five minutes by default:
+
+```go
+store, err := sqldriver.New(db, sqldriver.Postgres,
+	sqldriver.WithSweepInterval(time.Minute),
+	sqldriver.WithSweepBatchSize(500),
+	sqldriver.WithSweepTimeout(10*time.Second),
+)
+```
+
+Batching matters: an unbounded `DELETE` across a large table takes long locks. The sweeper deletes a
+batch at a time, looping while full batches come back. `WithSweepTimeout` bounds each batch
+statement individually, not the pass as a whole — a pass that takes N batches to finish gets up to
+N times that timeout in total.
+
+To run it from a cron job or a leader-elected instance instead, disable it and call it yourself:
+
+```go
+store, err := sqldriver.New(db, sqldriver.Postgres, sqldriver.WithSweepInterval(0))
+
+deleted, err := store.SweepOnce(ctx)
+```
+
+That is often the better arrangement in a large fleet — twenty instances each sweeping every five
+minutes is twenty times more delete traffic than the table needs.
+
+Without any sweeping the table grows until you clear it. Reads stay correct; the table does not.
+
+## Logging
+
+The sweeper logs failures through an `*slog.Logger`:
+
+```go
+sqldriver.New(db, sqldriver.Postgres, sqldriver.WithLogger(logger))
+```
+
+Defaults to `slog.Default()`. Passing `nil` silences it safely.
+
+## Locks
+
+[Atomic locks](/features/locks) work here. Set-if-absent is a transaction that clears an expired
+holder and then inserts, relying on the primary key for atomicity, and release is a
+compare-and-delete on the owner token.
+
+They are as reliable as your database, which is to say considerably more reliable than most caches —
+a lock in a Postgres table survives a restart of everything except Postgres.
+
+## Testing
+
+gocache's suite runs the SQL driver against in-process SQLite for unit tests, and against real
+Postgres and MySQL behind a build tag. The dialect-specific SQL is additionally pinned by tests that
+assert on the generated statements, so a Postgres form cannot silently regress into a MySQL one.
+
+For your own tests, SQLite in a temporary file is a fast, dependency-free way to exercise the driver
+end to end.

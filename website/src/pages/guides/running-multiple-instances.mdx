@@ -1,0 +1,113 @@
+# Running multiple instances
+
+One process caching in its own memory is simple. Several processes doing it is where caches start
+serving each other's stale data — this guide is about the bus, which is how gocache prevents that.
+
+## The problem
+
+Two instances, both with a memory cache, both holding `user:42`.
+
+Instance A handles a rename. It updates the database and deletes the key from its own cache. Its
+next read is correct.
+
+Instance B knows nothing. It keeps serving the old name from memory until the TTL expires. With a
+five-minute TTL, half your users see stale data for five minutes after every write, and which half
+depends on which instance the load balancer picked.
+
+A shared L2 alone does not fix it: B still has its own L1 copy and never consults L2 while that copy
+looks fresh.
+
+## The bus
+
+```go
+client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+
+cache, err := gocache.New(
+	gocache.WithL1(memory.New(memory.WithMaxEntries(10_000))),
+	gocache.WithL2(redisdriver.New(client)),
+	gocache.WithBus(redisbus.New(client)),
+	gocache.WithDefaultTTL(30*time.Minute),
+)
+```
+
+Now when A writes or deletes, it publishes a small message; B receives it and drops that key from
+its own L1. B's next read misses locally, goes to L2, and gets the new value.
+
+The bus carries **invalidations, not values**. Peers are told to forget, never told what to
+remember, so a message is small and it does not matter if two arrive out of order.
+
+It only touches L1 — L2 is already correct, having been written first.
+
+Each instance stamps its messages with a random origin ID and ignores its own, so the writer keeps
+the copy it just wrote.
+
+## Requirements
+
+A bus needs both tiers, and `New` rejects it otherwise. The reason is that its only job is
+reconciling a local tier against a shared one:
+
+- Without L1 there is no local copy to invalidate.
+- Without L2 there is no shared truth to reconcile against — peers would drop entries with nothing
+  to reload from.
+
+You can reuse the same Redis client for the driver and the bus, as above. gocache never closes a
+client you hand it.
+
+## What it costs
+
+One Redis Pub/Sub message per write, delete, clear or tag invalidation, and one subscriber goroutine
+per instance. The core puts a five-second deadline on the context it passes to `Publish`, so a slow
+bus can delay a caller for that long without failing the call — but only if the bus honours that
+context; a bus that ignores it can block the caller for longer.
+
+If your workload is write-heavy this is real traffic. Two ways to reduce it: `WithSkipBus` on
+individual writes whose staleness you can tolerate, and preferring
+[tag invalidation](/features/tags) over deleting many keys, since one tag message replaces many
+delete messages.
+
+## When the bus fails
+
+Nothing breaks, and no call fails.
+
+A failed publish goes into a bounded in-memory retry queue (1024 messages by default,
+`WithBusRetryQueueSize`) drained with backoff in the background. If the queue fills, the oldest
+message is dropped, and every failure and drop is reported as `EventBusPublishFailed`.
+
+Messages still queued when you `Close` are discarded.
+
+With the bus fully down, the system degrades to exactly the behaviour you would have without one:
+peers serve their own L1 copies until those expire. Staleness is bounded by your TTL rather than
+becoming unbounded — which is why a TTL matters even when you invalidate diligently.
+
+```go
+gocache.WithEventHook(func(e gocache.Event) {
+	if ev, ok := e.(gocache.EventBusPublishFailed); ok {
+		metrics.Inc("cache.bus_publish_failed", "dropped", strconv.FormatBool(ev.Dropped))
+	}
+})
+```
+
+Alert on that. A silently broken bus looks exactly like a working cache until someone reports seeing
+old data.
+
+## Sizing L1 across a fleet
+
+Each instance holds its own copy, so L1 memory is per-instance, not shared. Twenty instances with a
+10,000-entry L1 is 200,000 cached objects in total, most of them duplicates of the hot set.
+
+That duplication is the point — it is what makes reads local. But size `WithMaxEntries` against one
+instance's memory budget, not the size of your data.
+
+## Deployment notes
+
+**Rolling deploys.** A starting instance has a cold L1 and will lean on L2 until it warms. If your
+L2 is also cold, a deploy under load can stampede the database — [locks](/features/locks) around the
+most expensive rebuilds are the fix.
+
+**Give the cache its own Redis logical database.** It keeps a root `Clear` from touching your
+sessions or queues, and makes cache traffic separable in monitoring. See the warning in
+[Keys and namespaces](/concepts/keys-and-namespaces).
+
+**Clock skew.** Expiry is compared against each instance's own clock. Meaningful skew across your
+fleet means entries expire at different times on different instances — usually harmless, but worth
+knowing when a stale read is otherwise inexplicable.

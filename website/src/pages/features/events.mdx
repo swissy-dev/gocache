@@ -1,0 +1,126 @@
+# Events
+
+Most operations emit a typed event — `Has` and a failed `Lock.Acquire` are the exceptions, so
+`Block`'s retry loop leaves no trace here. Wire the hook to your metrics and you have cache
+observability without instrumenting most call sites.
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(memory.New()),
+	gocache.WithEventHook(func(e gocache.Event) {
+		switch ev := e.(type) {
+		case gocache.EventHit:
+			metrics.Inc("cache.hit", "tier", string(ev.Tier))
+		case gocache.EventMiss:
+			metrics.Inc("cache.miss")
+		case gocache.EventGraceHit:
+			metrics.Inc("cache.grace_hit")
+		}
+	}),
+)
+```
+
+## The events
+
+| Event | Fields | Emitted when |
+|---|---|---|
+| `EventHit` | `Key`, `Tier` | A read found a fresh entry |
+| `EventMiss` | `Key` | A read found nothing usable |
+| `EventWritten` | `Key`, `Tier` | An entry was written to a tier |
+| `EventDeleted` | `Key` | An entry was deleted |
+| `EventCleared` | `Prefix` | A `Clear` ran |
+| `EventTagInvalidated` | `Tag` | `DeleteByTag` invalidated a tag |
+| `EventGraceHit` | `Key`, `Err` | A stale value was served |
+| `EventFactoryError` | `Key`, `Err` | A factory returned an error or panicked |
+| `EventWriteFailed` | `Key`, `Err` | A `GetOrSet` result could not be cached |
+| `EventBusPublishFailed` | `Err`, `Dropped` | A bus publish failed or was dropped from the retry queue |
+| `EventBusMessageReceived` | `Op` | A peer's invalidation arrived |
+| `EventLockAcquired` | `Key` | A lock was taken |
+| `EventLockReleased` | `Key` | A lock was released |
+
+`Tier` is `TierL1` or `TierL2`.
+
+## The four worth alerting on
+
+Most of these are counters. These four mean something is wrong:
+
+**`EventGraceHit`** — you are serving stale data because a factory failed. Users have not noticed
+yet, which is exactly why this needs to be visible. `Err` carries the underlying failure, and is nil
+when the hit came from a [soft timeout](/features/timeouts) rather than an error.
+
+**`EventFactoryError`** — the factory returned an error or panicked. It fires unconditionally,
+inside the flight and before grace is even considered, so it does not mean the call failed: when
+grace covers the failure, the same call also emits `EventGraceHit` and still succeeds. Alerting on
+`EventFactoryError` alone as "a request failed" over-fires on every healthy grace hit — pair it with
+the absence of a following `EventGraceHit`, or alert on sustained volume rather than any single
+occurrence.
+
+**`EventWriteFailed`** — a `GetOrSet` computed a value but could not cache it. The call still
+returns successfully, so this event is the only signal in the *return value* — though the same
+failure is also logged at Warn. If every write is failing, your cache is doing nothing but adding
+latency, and this event (or the log line beside it) is how you would notice.
+
+**`EventBusPublishFailed`** — peers are not being told about invalidations, so they will serve stale
+copies until TTL. `Dropped` distinguishes a failed publish that was queued for retry from one
+evicted because the queue was full.
+
+## A worked example
+
+```go
+gocache.WithEventHook(func(e gocache.Event) {
+	switch ev := e.(type) {
+	case gocache.EventHit:
+		metrics.Inc("cache.hit", "tier", string(ev.Tier))
+	case gocache.EventMiss:
+		metrics.Inc("cache.miss")
+	case gocache.EventGraceHit:
+		metrics.Inc("cache.grace_hit")
+		if ev.Err != nil {
+			slog.Warn("serving stale", "key", ev.Key, "err", ev.Err)
+		}
+	case gocache.EventFactoryError:
+		metrics.Inc("cache.factory_error")
+		slog.Error("factory failed", "key", ev.Key, "err", ev.Err)
+	case gocache.EventWriteFailed:
+		metrics.Inc("cache.write_failed")
+		slog.Error("cache write failed", "key", ev.Key, "err", ev.Err)
+	case gocache.EventBusPublishFailed:
+		metrics.Inc("cache.bus_publish_failed", "dropped", strconv.FormatBool(ev.Dropped))
+	}
+})
+```
+
+The L1/L2 split on `EventHit` is worth keeping: the ratio between them tells you whether your local
+tier is sized correctly. Lots of L2 hits means L1 is too small or its TTLs are too short.
+
+## Rules for hooks
+
+**The hook is synchronous.** It runs on the goroutine performing the operation, so anything slow in
+it slows down every cache call. Increment a counter; do not make a network request.
+
+**`Get` and `Delete` are safe to call back into from a hook.** Hooks run after gocache's internal
+locks are released, so calling either from a hook will not deadlock. `GetOrSet` is different:
+calling it for the *same key* from a hook firing inside that key's own flight blocks on the
+singleflight call already in progress — verified, it hangs until a soft or hard timeout or a
+context deadline ends the wait, if one is even configured.
+
+:::danger[Never call Close from a hook]
+Events emitted from inside a `GetOrSet` flight run while that flight is registered with the cache's
+wait group, and `Close` waits on that group. A hook that calls `Close` on the `GetOrSet` path
+deadlocks permanently.
+:::
+
+**Panics are contained.** A panicking hook is recovered and logged rather than crashing your
+process. Don't rely on it, but a bug in your metrics code will not take down the service.
+
+**Cost when unset.** Leaving the hook unset skips your callback entirely, but the event value is
+still constructed and allocated. It is cheap, not free.
+
+## Events and the logger
+
+Some failures gocache swallows by design also go to an `*slog.Logger`, which defaults to
+`slog.Default()` and can be silenced with `WithLogger(nil)`.
+
+The two channels do not always travel together: a retried or dropped bus publish emits
+`EventBusPublishFailed` with no log line. Treat events as the complete signal and logs as a
+convenience for when nothing is wired up.

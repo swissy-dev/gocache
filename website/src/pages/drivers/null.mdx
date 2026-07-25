@@ -1,0 +1,78 @@
+# Null driver
+
+Stores nothing. Every read misses, every write silently succeeds.
+
+```go
+import "github.com/swissy-dev/gocache/driver/null"
+
+cache, err := gocache.New(gocache.WithL1(null.New()))
+```
+
+It exists so you can turn caching off without touching a single call site. Your code keeps calling
+`GetOrSet`, every factory runs, and the behaviour is exactly what you would get with a permanently
+cold cache.
+
+## When to use it
+
+**Disabling caching per environment.** Wire the driver from configuration:
+
+```go
+func newTier(cfg Config) gocache.Driver {
+	if !cfg.CacheEnabled {
+		return null.New()
+	}
+	return memory.New(memory.WithMaxEntries(cfg.CacheSize))
+}
+```
+
+**Isolating a bug.** If a failure disappears with caching off, it is an invalidation problem. If it
+persists, it is in your logic. That is a fast, decisive test.
+
+**Testing cold-cache behaviour.** Proving a handler still works when nothing is cached — including
+that it does not blow its latency budget.
+
+:::warning[Do not use null as L2 for local-only caching]
+Swapping `null` in for L2 looks like a tidy way to keep the two-tier shape while caching only in L1,
+but it silently breaks [grace](/features/grace-periods) and [soft timeouts](/features/timeouts).
+With a non-nil L2, a read that finds L1 stale falls through to L2 to reconcile — and the moment that
+L2 reports a miss, which `null` always does, gocache discards the stale L1 entry entirely instead of
+serving it. Fresh reads never reach that code path, so the breakage stays invisible until a factory
+actually fails.
+
+For local-only caching, leave `WithL2` off instead:
+
+```go
+cache, err := gocache.New(gocache.WithL1(memory.New()))
+```
+:::
+
+## The lock caveat
+
+:::danger[Locks on a null-backed cache never exclude]
+[Atomic locks](/features/locks) are built on set-if-absent. The null driver stores nothing, so
+set-if-absent always succeeds and **every `Acquire` returns true**.
+
+A cache whose authoritative tier is `null` provides no mutual exclusion whatsoever. Every instance
+believes it holds the lock, and whatever the lock was protecting runs everywhere at once.
+
+Disabling caching in a test is fine. Disabling it in a service that uses locks to keep a job from
+running twice is not.
+:::
+
+If you need locks with caching disabled, keep a real driver as the authoritative tier and use `null`
+for L1 instead.
+
+## Behaviour
+
+- `Get` always reports not found, with no error.
+- Writes report success and discard the value.
+- Set-if-absent always succeeds — see above.
+- Delete and compare-and-delete report that nothing was removed.
+- Clearing succeeds and does nothing.
+- `Close` is a no-op.
+
+It satisfies the full `Driver` contract, so used as the only tier, everything downstream —
+[tags](/features/tags), [events](/features/events), [grace](/features/grace-periods) — behaves as
+it would against a cache that is permanently empty: grace never has a stale value to serve, because
+nothing is ever fresh long enough to go stale, and every read emits `EventMiss`. That equivalence
+breaks the moment `null` sits behind a real L1 as L2 — see the warning above.

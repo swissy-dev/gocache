@@ -1,0 +1,161 @@
+# Writing a driver
+
+A driver is a byte store with a TTL. Everything else — envelopes, tiering, tags, grace, locking — is
+handled by the core, so a driver never sees a Go value or knows what a tag is.
+
+## The interface
+
+```go
+type Driver interface {
+	Get(ctx context.Context, key string) (value []byte, found bool, err error)
+	Set(ctx context.Context, key string, value []byte, ttl time.Duration) error
+	Add(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error)
+	Delete(ctx context.Context, key string) (bool, error)
+	DeleteMany(ctx context.Context, keys []string) error
+	DeleteIfEquals(ctx context.Context, key string, value []byte) (bool, error)
+	ClearPrefix(ctx context.Context, prefix string) error
+	Close() error
+}
+```
+
+It is composed from smaller interfaces — a reader, a writer, an atomic pair and `io.Closer` — but
+you implement all of it.
+
+## The contract
+
+Each method has semantics the core relies on. Get these wrong and failures show up far from the
+driver.
+
+**`Get`** — a miss is `(nil, false, nil)`. Not an error. Returning an error for a missing key breaks
+every read path, because the core cannot distinguish "absent" from "broken".
+
+**`Set`** — a TTL of zero means **no expiry**, not "expire immediately". This is the single most
+common mistake: mapping `ttl == 0` onto a backend's default expiry silently makes every permanent
+entry temporary.
+
+**`Add`** — atomic set-if-absent, returning whether it stored. An expired entry counts as absent.
+This backs [locks](/features/locks), so it must be genuinely atomic — a read followed by a write is
+not good enough, and a race here means two instances both believing they hold a lock.
+
+**`Delete`** — reports whether a *live* entry was removed. Deleting a key that exists but has
+expired reports `false`.
+
+**`DeleteMany`** — must tolerate an empty slice. Several backends error on a zero-argument delete.
+
+**`DeleteIfEquals`** — atomic compare-and-delete: remove the key only if its stored value matches
+exactly. This is what makes lock owner tokens safe, so it must be one atomic operation — a Lua
+script, a conditional statement, or a mutex.
+
+**`ClearPrefix`** — remove every key with the prefix. An empty prefix clears everything. If your
+backend uses pattern matching, escape metacharacters in the prefix, or a key containing a wildcard
+will delete unrelated data.
+
+**`Close`** — release your resources. Never close a client or handle the caller passed in; that
+belongs to them. It must also tolerate a concurrent in-flight operation, because `Cache.Close` does
+not join foreground calls.
+
+Drivers must be safe for concurrent use, and must never interpret the bytes they are given.
+
+## A worked example
+
+```go
+package mydriver
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+)
+
+type Driver struct {
+	client *thing.Client
+}
+
+func New(client *thing.Client) *Driver {
+	return &Driver{client: client}
+}
+
+func (d *Driver) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	v, err := d.client.Get(ctx, key)
+	if errors.Is(err, thing.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("mydriver: get: %w", err)
+	}
+	return v, true, nil
+}
+
+func (d *Driver) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	if ttl <= 0 {
+		if err := d.client.SetForever(ctx, key, value); err != nil {
+			return fmt.Errorf("mydriver: set: %w", err)
+		}
+		return nil
+	}
+	if err := d.client.Set(ctx, key, value, ttl); err != nil {
+		return fmt.Errorf("mydriver: set: %w", err)
+	}
+	return nil
+}
+
+func (d *Driver) Close() error {
+	return nil
+}
+```
+
+Wrap errors with `%w` and prefix them with your package name, so a failure surfacing three layers up
+still says where it came from.
+
+## Testing it
+
+gocache ships the conformance suite its own drivers are held to — every shipped driver runs it
+except `null`, whose `Add` always returns `true` and would fail the `Add` subtest; it gets a bespoke
+test instead. Run your driver through it:
+
+```go
+package mydriver
+
+import (
+	"testing"
+
+	"github.com/swissy-dev/gocache"
+	"github.com/swissy-dev/gocache/driver/drivertest"
+)
+
+func TestConformance(t *testing.T) {
+	drivertest.Run(t, drivertest.Config{
+		New: func(t *testing.T) gocache.Driver {
+			return New(newTestClient(t))
+		},
+	})
+}
+```
+
+It covers most of the contract above: zero-TTL permanence, expiry, atomic add including after
+expiry, compare-and-delete, prefix clearing, live-versus-expired delete reporting, and that a driver
+does not alias the caller's bytes. It does not cover all of it: no subtest passes `DeleteMany` an
+empty slice, nothing in the suite runs concurrently — so `Add` and `DeleteIfEquals` are exercised in
+sequence, never actually raced — `Close` is never called, and metacharacter escaping in
+`ClearPrefix` goes unexercised. Passing it is necessary, not sufficient.
+
+If your backend does not expire on the wall clock — an in-process fake, or a test double — supply an
+`Advance` hook so the suite can move its clock:
+
+```go
+drivertest.Run(t, drivertest.Config{
+	New:     func(t *testing.T) gocache.Driver { return New(server) },
+	Advance: func(t *testing.T, d time.Duration) { server.FastForward(d) },
+})
+```
+
+Leave it nil and the suite sleeps for real.
+
+Passing the suite is the bar for a driver being usable. Everything gocache guarantees rests on these
+semantics holding.
+
+## Writing a bus instead
+
+The [bus interface](/bus/custom) is smaller still — publish, subscribe, close — and is what you
+implement to carry invalidations over something other than Redis.

@@ -1,0 +1,91 @@
+# The bus
+
+The bus is how one instance tells the others to forget something. Without it, every instance serves
+its own L1 copy until the TTL expires, no matter what the shared tier says.
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(memory.New()),
+	gocache.WithL2(redisdriver.New(client)),
+	gocache.WithBus(redisbus.New(client)),
+)
+```
+
+See [Running multiple instances](/guides/running-multiple-instances) for the problem it solves and
+how to operate it. This page is about the mechanics.
+
+## What travels
+
+Invalidations, never values. A message says "drop this key", "drop this prefix", or "this tag
+changed" — it never carries data, so messages stay small and out-of-order delivery is harmless.
+
+A message is published on every write, delete, clear and tag invalidation. On receipt, a peer
+evicts from **L1 only**; L2 is already correct, having been written first.
+
+Each instance generates a random origin ID at startup and stamps its messages with it, then ignores
+anything carrying its own. That is what lets the writer keep the copy it just wrote while every peer
+drops theirs.
+
+## Both tiers required
+
+`New` rejects a bus without an L1 and an L2. Its only function is reconciling a local tier against a
+shared one: with no L1 there is nothing to invalidate, and with no L2 there is nothing to reload
+from.
+
+## Failure handling
+
+A bus failure never fails your call. A publish that errors goes into a bounded in-memory retry queue
+— 1024 messages by default, `WithBusRetryQueueSize` — drained with backoff by a background goroutine
+that `Close` joins. When the queue is full the oldest message is dropped.
+
+Every failure and drop emits `EventBusPublishFailed`, with `Dropped` distinguishing the two.
+Messages still queued at `Close` are discarded.
+
+The core gives a bus five seconds: it puts that deadline on the context it passes to `Publish`, so a
+slow bus can delay a caller for that long even though it will not fail them. Honouring the deadline
+is the bus's job, though — a bus that ignores its context, the way memorybus does below, can block
+the caller for longer.
+
+## The implementations
+
+### memorybus
+
+```go
+import "github.com/swissy-dev/gocache/bus/memorybus"
+```
+
+In-process, synchronous — `Publish` invokes every live subscriber's handler before returning. It
+carries nothing between processes, so it is for tests and for single-process setups where you want
+the bus code path exercised.
+
+### redisbus
+
+```go
+import "github.com/swissy-dev/gocache/bus/redisbus"
+
+bus := redisbus.New(client, redisbus.WithChannel("myapp:cache"))
+```
+
+Redis Pub/Sub. One channel, `gocache:bus` by default; override it with `WithChannel` if several
+applications share a Redis instance and you want their invalidations kept apart.
+
+The client is yours — `Close` shuts down the bus's subscriptions and joins its goroutine, but never
+closes the client. Sharing one client between the Redis driver and the bus is fine and normal, since
+go-redis puts subscriptions on their own connections.
+
+Pub/Sub is fire-and-forget: an instance that is down or disconnected when a message is published
+does not receive it later. Peers reconcile on their own when their entries expire, which is why a
+TTL still matters.
+
+:::warning[Never call Close from inside a handler]
+`Close` joins the goroutine that delivers messages to your handler. A handler that calls `Bus.Close()`
+on itself waits for its own goroutine to finish and deadlocks permanently.
+
+This is a deliberate consequence of `Close` guaranteeing no handler runs after it returns. Close the
+bus from somewhere else.
+:::
+
+## Writing your own
+
+If you carry messages over NATS, Kafka, or something in-house, see [Writing a bus](/bus/custom). The
+interface is three methods.

@@ -1,0 +1,128 @@
+# Cache-aside and stampedes
+
+`GetOrSet` is the operation you will use most. It returns the cached value if there is one, and
+otherwise runs your factory, stores the result and returns it:
+
+```go
+user, err := gocache.GetOrSet(ctx, cache, "user:42", func(ctx context.Context) (User, error) {
+	return db.FindUser(ctx, 42)
+}, gocache.WithTTL(time.Minute), gocache.WithTags("users"))
+```
+
+Written by hand, that is three operations, two error paths, and a race. `GetOrSet` is one call with
+one error path and no race.
+
+## The stampede problem
+
+Here is what the hand-written version gets wrong. A popular key expires. In the next fifty
+milliseconds, five hundred requests arrive for it. Every one of them misses, and every one of them
+queries the database.
+
+The database was fine a moment ago. Now it is serving five hundred identical queries, each one
+slower than the last because they are competing, and the requests that triggered them are timing
+out. Load sheds, the key still isn't cached, and the next wave does it again. This is a cache
+stampede, and it takes down the thing the cache was supposed to protect.
+
+## What GetOrSet guarantees
+
+On a miss, `GetOrSet` opens a **flight** for that key. The first caller runs the factory; every
+other caller for the same key waits for that same result. Fifty goroutines, one database query,
+fifty happy callers.
+
+```go
+var wg sync.WaitGroup
+for range 50 {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = gocache.GetOrSet(ctx, cache, "hot", loadExpensiveThing)
+	}()
+}
+wg.Wait()
+```
+
+Singleflight collapses all fifty overlapping calls into one flight, so `loadExpensiveThing` runs
+once for this batch. "Overlapping" is the operative word — a goroutine that called `GetOrSet` after
+the flight had already finished and written its result would simply hit the now-warm cache instead
+of joining a flight at all.
+
+The guarantee is **per instance**. Ten instances that all miss simultaneously will make ten calls,
+not one. If a single fleet-wide call is what you need, take an [atomic lock](/features/locks) around
+the work.
+
+## Callers who give up
+
+The flight belongs to the cache, not to whichever caller happened to open it. If that caller's
+context is cancelled — the user closed the tab, the request timed out — the flight keeps running for
+everyone still waiting, and the cancelled caller simply returns its own context error.
+
+This matters more than it sounds. The naive implementation ties the factory to the first caller's
+context, so a single impatient client cancels work that dozens of others are blocked on, and they
+all fail with a cancellation error they had nothing to do with.
+
+Each caller waits on its own context, so cancellation affects exactly the caller who cancelled.
+
+:::warning[The factory inherits the first caller's context values]
+Cancellation is detached, but context *values* are not — the factory sees the values from whichever
+caller started the flight. A request ID, trace span or request-scoped handle read inside a factory
+may belong to a different request than the one you are serving.
+
+Pass anything the factory needs through the closure instead of pulling it out of the context.
+:::
+
+## Errors
+
+If the factory fails, the error comes back wrapped, and the failure is not cached — the next caller
+tries again:
+
+```go
+user, err := gocache.GetOrSet(ctx, cache, "user:42", func(ctx context.Context) (User, error) {
+	return db.FindUser(ctx, 42)
+})
+if err != nil {
+	return err   // user is the zero value
+}
+```
+
+That holds throughout gocache: when `err != nil` the value is the zero value and must not be used.
+
+A [grace period](/features/grace-periods) changes what counts as a failure — with grace configured,
+a factory error on a key with a recent stale copy returns that copy with a nil error.
+
+:::info[A failed cache write does not fail the call]
+If the factory succeeds but writing the result to the cache fails, `GetOrSet` returns the value with
+a **nil error**. You asked for a value and gocache has one; the caching was best-effort.
+
+The write failure is reported as `EventWriteFailed` and a log line. If a cache whose writes are all
+failing would be a problem for you — and it usually is, since every call becomes a factory call —
+watch that event. Note this differs from plain `Set`, which does return the write error.
+:::
+
+## Panics
+
+A panicking factory does not take down your process and does not strand the callers waiting on it.
+The panic is recovered at the flight boundary, converted into an error, delivered to every waiter,
+and reported as `EventFactoryError`.
+
+You still want to fix the panic. But a bug in one cache factory should not be an outage.
+
+## Values that never expire
+
+```go
+cfg, err := gocache.GetOrSetForever(ctx, cache, "config", loadConfig)
+```
+
+Same behaviour with no TTL. Useful for things that change only on deploy, or that you invalidate
+explicitly by key or [tag](/features/tags).
+
+## When not to use it
+
+`GetOrSet` assumes the factory is idempotent and side-effect-free — it may run on any instance, at
+any time, possibly in the background after a [soft timeout](/features/timeouts). If the work must
+happen exactly once, or has side effects, use a [lock](/features/locks) and drive it explicitly.
+
+For a value you have already computed, `Set` is the honest call, not `GetOrSet`. The two are not
+interchangeable: `Set` always writes, overwriting whatever is there. `GetOrSet` writes only on a
+miss — if a fresh entry already exists, it returns that existing value and never calls your factory
+at all. Wrapping an already-computed value in a factory just to call `GetOrSet` buys you the
+overhead of a flight for a write that might silently not happen.

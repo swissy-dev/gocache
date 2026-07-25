@@ -1,0 +1,146 @@
+# Tiers
+
+A cache is built from one or two tiers. `WithL1` is the local tier, `WithL2` the shared one. At
+least one is required; which you pick decides what your cache can and cannot do.
+
+## The three shapes
+
+### L1 only
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(memory.New(memory.WithMaxEntries(10_000))),
+)
+```
+
+Process-local memory. Microsecond reads, no network, nothing shared. Every instance builds its own
+copy of everything, and an invalidation in one process is invisible to the others.
+
+Right for single-process programs, CLI tools, and per-instance caches of things that are cheap to
+recompute and harmless to duplicate.
+
+### L2 only
+
+```go
+cache, err := gocache.New(
+	gocache.WithL2(redisdriver.New(client)),
+)
+```
+
+Every read and write crosses the network to the shared store. Slower, but there is exactly one copy
+of the truth and an invalidation is immediately visible everywhere.
+
+Right when correctness matters more than latency, when your working set is too large to duplicate in
+every process, or when you are caching something that must not be served stale from a peer that
+hasn't heard the news.
+
+### Both
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(memory.New(memory.WithMaxEntries(10_000))),
+	gocache.WithL2(redisdriver.New(client)),
+	gocache.WithBus(redisbus.New(client)),
+)
+```
+
+The reason this library exists. Reads are usually local; the shared tier is consulted only when
+local memory has nothing fresh; and the [bus](/bus/overview) tells peers to drop their copies when
+data changes.
+
+A bus requires both tiers, because its whole job is reconciling L1 against L2. `New` rejects a bus
+configured without both.
+
+## The read path
+
+```
+Get(key)
+  │
+  ├─ L1 has it and it's fresh?  ──▶ return
+  │
+  ├─ L2 has it and it's fresh?  ──▶ copy into L1, return
+  │
+  └─ otherwise                  ──▶ miss
+```
+
+Two properties follow:
+
+**Backfill.** A read served from L2 is written into L1 on the way back, so the next read in this
+process is local. The backfilled entry keeps the remaining logical TTL of the original — it does not
+get a fresh lease on life.
+
+**L2 is authoritative.** If L1 holds a stale entry and L2 has none, the answer is a miss. gocache
+will not serve a local copy the shared tier has already discarded. This is what keeps a peer from
+resurrecting data everyone else has forgotten.
+
+`Get` never returns a logically stale value. Serving stale data is opt-in and happens only through
+[grace periods](/features/grace-periods) on `GetOrSet`.
+
+## The write path
+
+```
+Set(key, value)
+  │
+  ├─ write L2   (authoritative first)
+  ├─ write L1
+  └─ publish invalidation on the bus
+```
+
+If L2 fails, the write returns that error and L1 is left alone — better a local miss than a local
+copy of something the shared tier never accepted.
+
+If L1 fails after L2 succeeded, the write returns the error but the bus publish still happens,
+because the shared tier really did change and peers need to know.
+
+## Skipping a tier for one call
+
+Two per-call options let you opt out:
+
+```go
+err := gocache.Set(ctx, cache, "report:2024", report,
+	gocache.WithSkipL1(),   // don't keep it in this process's memory
+	gocache.WithSkipBus(),  // don't tell peers about it
+)
+```
+
+`WithSkipL1` is for values you want shared but don't want occupying local memory — a large report
+this instance won't read again. `WithSkipBus` suppresses the invalidation message, which is
+occasionally useful for bulk loading where you'd otherwise flood the bus, at the cost of peers
+keeping stale copies until their TTL expires.
+
+:::warning[WithSkipL1 does not invalidate an existing L1 entry]
+`WithSkipL1` only suppresses the L1 *write* on this call — it does not delete a copy this process
+already has cached, and the bus `delete` message the write publishes is ignored by its own origin
+(every instance ignores its own bus messages). So `Set(ctx, cache, k, "v1")` followed by
+`Set(ctx, cache, k, "v2", gocache.WithSkipL1())` leaves *this* process serving `"v1"` from L1 while
+every peer correctly serves `"v2"`. The inline comment above — "don't keep it in this process's
+memory" — only holds if this process didn't already have a copy to begin with. Use `WithSkipL1` on
+keys this process has not previously cached, or call `Delete` first if it might have.
+:::
+
+## Mixing driver types
+
+Nothing requires L1 to be the memory driver or L2 to be Redis. The tiers take any
+[`Driver`](/drivers/custom), and the distinction is purely about which one is consulted first and
+which one is authoritative. Two useful combinations:
+
+Memory in front of your existing SQL database — no new infrastructure:
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(memory.New()),
+	gocache.WithL2(sqlStore),
+)
+```
+
+Disable local caching in one environment without touching call sites:
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(null.New()),
+	gocache.WithL2(redisdriver.New(client)),
+)
+```
+
+The second is worth remembering: [`null`](/drivers/null) satisfies the driver contract and stores
+nothing, so it turns a tier off without changing a line of calling code.

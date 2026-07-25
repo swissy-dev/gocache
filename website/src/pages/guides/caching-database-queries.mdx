@@ -1,0 +1,193 @@
+# Caching database queries
+
+The canonical use. This guide builds it up properly — including the invalidation, which is the part
+that usually gets skipped and then causes a bug report.
+
+## The naive version
+
+```go
+func (s *Service) User(ctx context.Context, id int) (User, error) {
+	return s.db.FindUser(ctx, id)
+}
+```
+
+Correct, and it queries the database every time.
+
+## Caching it
+
+```go
+func (s *Service) User(ctx context.Context, id int) (User, error) {
+	return gocache.GetOrSet(ctx, s.cache, fmt.Sprintf("user:%d", id),
+		func(ctx context.Context) (User, error) {
+			return s.db.FindUser(ctx, id)
+		},
+		gocache.WithTTL(5*time.Minute),
+	)
+}
+```
+
+That is the whole pattern. Concurrent callers for the same user collapse to one query, the result is
+served from memory afterwards, and callers see no difference except latency.
+
+Note the factory closes over `id` rather than reading it from the context. The factory may run on
+behalf of a different caller than the one you are serving, so anything it needs must come through
+the closure.
+
+## Invalidating on write
+
+A cache with only a TTL serves stale data for up to that TTL after every update. Usually you can do
+better: invalidate when you write.
+
+```go
+func (s *Service) Rename(ctx context.Context, id int, name string) error {
+	if err := s.db.RenameUser(ctx, id, name); err != nil {
+		return err
+	}
+	_, err := s.cache.Delete(ctx, fmt.Sprintf("user:%d", id))
+	return err
+}
+```
+
+Write to the database first, then invalidate. The other order has a race: between the invalidation
+and the commit, a concurrent read repopulates the cache with the old value, and it stays wrong until
+the TTL saves you.
+
+Even in this order there is a narrow window — a read that loaded the old row before the commit can
+write it back after the invalidation. A TTL bounds it; a short TTL bounds it more. If you truly
+cannot tolerate that, do not cache reads that must reflect writes immediately.
+
+## Invalidating related entries
+
+Renaming a user should also invalidate the team listing that embeds their name, and the permissions
+view, and the admin search result. Deleting each key by hand does not scale — you will forget one.
+
+[Tag](/features/tags) the entries instead:
+
+```go
+func (s *Service) User(ctx context.Context, id int) (User, error) {
+	return gocache.GetOrSet(ctx, s.cache, fmt.Sprintf("user:%d", id),
+		func(ctx context.Context) (User, error) {
+			return s.db.FindUser(ctx, id)
+		},
+		gocache.WithTTL(5*time.Minute),
+		gocache.WithTags(fmt.Sprintf("user:%d", id), "users"),
+	)
+}
+
+func (s *Service) TeamMembers(ctx context.Context, teamID int) ([]User, error) {
+	return gocache.GetOrSet(ctx, s.cache, fmt.Sprintf("team:%d:members", teamID),
+		func(ctx context.Context) ([]User, error) {
+			return s.db.TeamMembers(ctx, teamID)
+		},
+		gocache.WithTTL(5*time.Minute),
+		gocache.WithTags("users", fmt.Sprintf("team:%d", teamID)),
+	)
+}
+```
+
+Now one call covers everything derived from that user:
+
+```go
+func (s *Service) Rename(ctx context.Context, id int, name string) error {
+	if err := s.db.RenameUser(ctx, id, name); err != nil {
+		return err
+	}
+	return s.cache.DeleteByTag(ctx, fmt.Sprintf("user:%d", id))
+}
+```
+
+Tag by what the data *is about*, not where it is stored. Anything embedding user 42 carries
+`user:42`, wherever it lives.
+
+## Caching a list
+
+Lists want a key that encodes every parameter that changes the result:
+
+```go
+func (s *Service) SearchUsers(ctx context.Context, q string, page int) ([]User, error) {
+	key := fmt.Sprintf("users:search:%s:%d", url.QueryEscape(q), page)
+
+	return gocache.GetOrSet(ctx, s.cache, key,
+		func(ctx context.Context) ([]User, error) {
+			return s.db.SearchUsers(ctx, q, page)
+		},
+		gocache.WithTTL(time.Minute),
+		gocache.WithTags("users"),
+	)
+}
+```
+
+Two things to watch. Escape anything user-supplied, or a query containing your separator will
+collide with a different one. And give searches a shorter TTL than single entities — the key space
+is unbounded, every distinct query is a new entry, and the memory driver will evict under the
+pressure.
+
+The `users` tag means any user change clears every cached search. That is usually the right
+trade-off: search results are cheap to rebuild and expensive to get wrong.
+
+## Not found
+
+A missing row is a legitimate result, and it is worth caching — otherwise a hot 404 hits the
+database on every request.
+
+Cache the absence explicitly rather than an error, since gocache does not cache factory errors:
+
+```go
+type maybeUser struct {
+	User  User `json:"user"`
+	Found bool `json:"found"`
+}
+
+func (s *Service) User(ctx context.Context, id int) (User, bool, error) {
+	got, err := gocache.GetOrSet(ctx, s.cache, fmt.Sprintf("user:%d", id),
+		func(ctx context.Context) (maybeUser, error) {
+			user, err := s.db.FindUser(ctx, id)
+			if errors.Is(err, sql.ErrNoRows) {
+				return maybeUser{Found: false}, nil
+			}
+			if err != nil {
+				return maybeUser{}, err
+			}
+			return maybeUser{User: user, Found: true}, nil
+		},
+		gocache.WithTTL(time.Minute),
+	)
+	if err != nil {
+		return User{}, false, err
+	}
+	return got.User, got.Found, nil
+}
+```
+
+A different TTL for the negative case is tempting but not something this shape can give you:
+`GetOrSet`'s call options — including `WithTTL` — are resolved before the flight runs, so the same
+TTL applies no matter what the factory returns. If negative entries genuinely need to expire faster
+than positive ones, cache them under a separate key (`user:404:%d`, its own `GetOrSet` call with its
+own TTL) or drop down to `Get` plus an explicit `Set` that chooses the TTL after seeing the result —
+which gives up the stampede protection `GetOrSet` was providing. The cache-penetration defence
+itself does not depend on the split: even one shared TTL stops a hot 404 from reaching the database
+on every request.
+
+## Surviving an outage
+
+Once the pattern is in place, [grace](/features/grace-periods) and
+[timeouts](/features/timeouts) are configuration rather than code:
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(memory.New(memory.WithMaxEntries(50_000))),
+	gocache.WithL2(redisdriver.New(client)),
+	gocache.WithBus(redisbus.New(client)),
+	gocache.WithDefaultTTL(5*time.Minute),
+	gocache.WithDefaultGrace(time.Hour),
+	gocache.WithSoftTimeout(150*time.Millisecond),
+	gocache.WithHardTimeout(10*time.Second),
+)
+```
+
+Your database goes down; users keep seeing data up to an hour old. It gets slow; they get an answer
+in 150 ms while the refresh continues in the background. Add `WithGrace(0)` on the handful of calls
+where stale data is unacceptable — but only on calls that merely read an existing entry. If the call
+you add it to is the one whose factory ends up writing the entry, `WithGrace(0)` also strips that
+entry's physical grace headroom for every other caller of the key (see
+[Grace periods](/features/grace-periods)).

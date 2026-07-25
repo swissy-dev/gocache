@@ -1,0 +1,124 @@
+# Grace periods
+
+A grace period lets `GetOrSet` serve a recently-expired value when the factory fails, instead of
+failing the request.
+
+```go
+cache, err := gocache.New(
+	gocache.WithL1(memory.New()),
+	gocache.WithL2(redisdriver.New(client)),
+	gocache.WithBus(redisbus.New(client)),
+	gocache.WithDefaultTTL(5*time.Minute),
+	gocache.WithDefaultGrace(6*time.Hour),
+)
+```
+
+Grace is off by default. Turning it on is a decision that stale data is better than no data, which
+is true for a lot of things and false for a few.
+
+## What it does
+
+With grace configured, an entry is physically kept for its TTL *plus* the grace period. It stops
+being served as fresh when the TTL runs out, but it is still sitting there.
+
+When the factory then fails, `GetOrSet` returns that stale copy with a **nil error**:
+
+```go
+user, err := gocache.GetOrSet(ctx, cache, "user:42", func(ctx context.Context) (User, error) {
+	return db.FindUser(ctx, 42)   // database is down
+})
+// err == nil, user is the value from up to six hours ago
+```
+
+The nil error is intentional. You configured grace, which is a standing instruction to prefer stale
+data over failure — so serving it is the success you asked for, not an error to handle. The
+underlying failure is reported as `EventGraceHit` carrying the factory's error, plus a log line.
+
+Without grace, that same factory error is returned and the value is the zero value.
+
+## Bounding staleness per call
+
+`WithGrace` narrows or widens the window for a single call, and it is a real duration, not a switch:
+
+```go
+// This caller tolerates at most a minute of staleness, whatever the default is.
+balance, err := gocache.GetOrSet(ctx, cache, "balance:42", loadBalance,
+	gocache.WithGrace(time.Minute))
+```
+
+A stale entry is served only while it is within the given duration of its logical expiry. On a cache
+with a six-hour default, that call will not accept a three-hour-old value.
+
+`WithGrace(0)` disables grace for one call, restoring strict behaviour:
+
+```go
+// Never serve stale here — a wrong answer is worse than an error.
+total, err := gocache.GetOrSet(ctx, cache, "invoice:99:total", loadTotal,
+	gocache.WithGrace(0))
+```
+
+:::warning[WithGrace(0) also strips physical headroom when that call writes the entry]
+`WithGrace` does two different jobs depending on whether the call hits or misses. On a hit it only
+decides whether *this* caller accepts a stale value. On a miss, the factory runs and writes a fresh
+entry, and that same `WithGrace(0)` becomes the grace used to compute the entry's physical lifetime
+(see [Expiry](/concepts/expiry)). A `WithGrace(0)` call that ends up being the one that writes the
+entry leaves it with no grace headroom at all — every other caller of that key loses the stale
+fallback too, until a later write restores it.
+:::
+
+Note that a per-call grace *larger* than what was in effect when the entry was written has nothing
+extra to work with: the entry's physical lifetime is fixed at write time by whichever grace was in
+effect on the call that wrote it — not by the cache-wide default. Narrowing on a read always works,
+since gocache simply won't reach past the smaller window you asked for. Widening on a read only
+helps up to that write-time lifetime: past it, the bytes are already gone.
+
+## What grace does not cover
+
+:::warning[Grace applies to factory failures, not tier failures]
+Grace catches errors from *your factory* — the database, the API, whatever the value comes from.
+
+If a cache tier itself is unreachable, the read fails before the factory is ever consulted, and
+`GetOrSet` returns that error. A Redis outage produces a Redis error, not a grace hit.
+:::
+
+There is a second limit worth knowing: a grace hit needs the stale copy to still be readable. If L2
+has already dropped the key — evicted under memory pressure, swept, or flushed — there is nothing to
+fall back on and the factory error surfaces normally. Grace makes the fallback *likely*, not
+guaranteed.
+
+## Choosing a window
+
+The question to ask is: how old can this be before serving it does harm?
+
+| Data | A reasonable grace |
+|---|---|
+| Product catalogue, marketing copy | Hours — staleness is invisible |
+| User profile, settings | Minutes to an hour |
+| Permissions, feature flags | Short, or none — stale access decisions are a security issue |
+| Prices, balances, inventory | None — wrong numbers are worse than an error |
+
+A useful default is a grace period comfortably longer than your worst realistic outage, on data
+where staleness is cosmetic, and no grace at all on data where it is not. Mixed requirements are
+what per-call `WithGrace` is for.
+
+## Observing it
+
+A grace hit means something upstream is broken. It should be visible:
+
+```go
+gocache.WithEventHook(func(e gocache.Event) {
+	if ev, ok := e.(gocache.EventGraceHit); ok {
+		metrics.Inc("cache.grace_hit")
+		if ev.Err != nil {
+			log.Warn("serving stale", "key", ev.Key, "err", ev.Err)
+		}
+	}
+})
+```
+
+`EventGraceHit.Err` is nil when the hit came from a [soft timeout](/features/timeouts) rather than a
+failure — at that point nothing has gone wrong, the factory is merely slow and still running. It is
+populated only when a real factory error triggered the fallback.
+
+A rising grace-hit rate is the signal that your origin is unhealthy and your users have not noticed
+yet. That is the whole value of the feature — and the reason not to let the metric go unwatched.
