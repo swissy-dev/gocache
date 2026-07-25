@@ -31,15 +31,13 @@ persists, it is in your logic. That is a fast, decisive test.
 **Testing cold-cache behaviour.** Proving a handler still works when nothing is cached — including
 that it does not blow its latency budget.
 
-:::warning[Do not use null as L2 for local-only caching]
-Swapping `null` in for L2 looks like a tidy way to keep the two-tier shape while caching only in L1,
-but it silently breaks [grace](/features/grace-periods) and [soft timeouts](/features/timeouts).
-With a non-nil L2, a read that finds L1 stale falls through to L2 to reconcile — and the moment that
-L2 reports a miss, which `null` always does, gocache discards the stale L1 entry entirely instead of
-serving it. Fresh reads never reach that code path, so the breakage stays invisible until a factory
-actually fails.
+:::info[null as L2 keeps grace working]
+Swapping `null` in for L2 is a tidy way to keep the two-tier shape while caching only in L1. A read
+that finds L1 stale falls through to L2, and when that L2 reports a miss — which `null` always does
+— the stale L1 entry is kept as a fallback, so [grace](/features/grace-periods) and
+[soft timeouts](/features/timeouts) behave as they do on a single-tier cache.
 
-For local-only caching, leave `WithL2` off instead:
+Leaving `WithL2` off entirely is still the simpler way to say the same thing:
 
 ```go
 cache, err := gocache.New(gocache.WithL1(memory.New()))
@@ -71,8 +69,8 @@ for L1 instead.
 - Clearing succeeds and does nothing.
 - `Close` is a no-op.
 
-It satisfies the full `Driver` contract, so used as the only tier, everything downstream —
-[tags](/features/tags), [events](/features/events), [grace](/features/grace-periods) — behaves as
-it would against a cache that is permanently empty: grace never has a stale value to serve, because
-nothing is ever fresh long enough to go stale, and every read emits `EventMiss`. That equivalence
-breaks the moment `null` sits behind a real L1 as L2 — see the warning above.
+It satisfies the full `Driver` contract, so everything downstream — [tags](/features/tags),
+[events](/features/events), [grace](/features/grace-periods) — behaves as it would against a cache
+that is permanently empty. As the only tier, that means grace never has a stale value to serve,
+because nothing is ever fresh long enough to go stale, and every read emits `EventMiss`. Behind a
+real L1, the L1 entry is what grace falls back on.

@@ -69,9 +69,12 @@ Two properties follow:
 process is local. The backfilled entry keeps the remaining logical TTL of the original — it does not
 get a fresh lease on life.
 
-**L2 is authoritative.** If L1 holds a stale entry and L2 has none, the answer is a miss. gocache
-will not serve a local copy the shared tier has already discarded. This is what keeps a peer from
-resurrecting data everyone else has forgotten.
+**L2 is authoritative.** If L1 holds a stale entry and L2 has none, the answer is still a miss —
+gocache will not serve a local copy as though it were fresh. The stale envelope is kept as a
+fallback candidate, though, so [grace](/features/grace-periods) can use it if the factory then
+fails. An explicit `Delete`, `DeleteByTag` or `Clear` removes or invalidates the L1 copy too, so a
+stale L1 entry outliving L2 means L2 dropped it for a non-semantic reason — eviction, expiry, or a
+tier that stores nothing.
 
 `Get` never returns a logically stale value. Serving stale data is opt-in and happens only through
 [grace periods](/features/grace-periods) on `GetOrSet`.
@@ -108,15 +111,10 @@ this instance won't read again. `WithSkipBus` suppresses the invalidation messag
 occasionally useful for bulk loading where you'd otherwise flood the bus, at the cost of peers
 keeping stale copies until their TTL expires.
 
-:::warning[WithSkipL1 does not invalidate an existing L1 entry]
-`WithSkipL1` only suppresses the L1 *write* on this call — it does not delete a copy this process
-already has cached, and the bus `delete` message the write publishes is ignored by its own origin
-(every instance ignores its own bus messages). So `Set(ctx, cache, k, "v1")` followed by
-`Set(ctx, cache, k, "v2", gocache.WithSkipL1())` leaves *this* process serving `"v1"` from L1 while
-every peer correctly serves `"v2"`. The inline comment above — "don't keep it in this process's
-memory" — only holds if this process didn't already have a copy to begin with. Use `WithSkipL1` on
-keys this process has not previously cached, or call `Delete` first if it might have.
-:::
+`WithSkipL1` removes the key from L1 rather than merely declining to write it, so it cannot leave
+this process serving an older copy than its peers. It suppresses the local copy for *this write*
+only: a later read that finds the entry in L2 still backfills L1 as usual. To keep a value out of
+local memory permanently, configure the cache without an L1.
 
 ## Mixing driver types
 

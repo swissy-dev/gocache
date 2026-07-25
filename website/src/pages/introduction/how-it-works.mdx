@@ -27,8 +27,9 @@ A read walks the tiers in order:
 3. Otherwise it's a miss.
 
 L2 is authoritative, which has one consequence worth internalising: if L1 holds a stale entry and
-L2 has nothing, the result is a miss. gocache does not fall back to a stale local copy just because
-the shared tier has moved on.
+L2 has nothing, the result is a miss — gocache does not serve a local copy as fresh just because the
+shared tier has moved on. The stale entry is kept as a fallback candidate, so
+[grace](/features/grace-periods) can still use it if the factory fails.
 
 ### Writing
 

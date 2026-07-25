@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/swissy-dev/gocache/driver/memory"
+	"github.com/swissy-dev/gocache/driver/null"
 )
 
 func staleEntry(t *testing.T, c *Cache, clk *fakeClock) {
@@ -194,4 +195,60 @@ func TestCloseWaitsForDetachedFactory(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestGraceServesStaleL1WhenL2HasDroppedTheKey(t *testing.T) {
+	l1 := memory.New()
+	l2 := memory.New()
+	clk := newFakeClock()
+	c, err := New(WithL1(l1), WithL2(l2), WithClock(clk.Now), WithDefaultGrace(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx := context.Background()
+	if err := Set(ctx, c, "k", user{Name: "stale"}, WithTTL(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l2.ClearPrefix(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	clk.Advance(2 * time.Minute)
+
+	boom := errors.New("boom")
+	v, err := GetOrSet(ctx, c, "k", func(context.Context) (user, error) {
+		return user{}, boom
+	})
+	if err != nil {
+		t.Fatalf("expected a grace hit from the stale L1 copy, got %v", err)
+	}
+	if v.Name != "stale" {
+		t.Fatalf("v = %+v", v)
+	}
+}
+
+func TestGraceStillWorksWhenL2IsNullBacked(t *testing.T) {
+	clk := newFakeClock()
+	c, err := New(WithL1(memory.New()), WithL2(null.New()), WithClock(clk.Now), WithDefaultGrace(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx := context.Background()
+	if err := Set(ctx, c, "k", user{Name: "stale"}, WithTTL(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	clk.Advance(2 * time.Minute)
+
+	v, err := GetOrSet(ctx, c, "k", func(context.Context) (user, error) {
+		return user{}, errors.New("boom")
+	})
+	if err != nil {
+		t.Fatalf("expected a grace hit, got %v", err)
+	}
+	if v.Name != "stale" {
+		t.Fatalf("v = %+v", v)
+	}
 }

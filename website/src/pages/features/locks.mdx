@@ -34,12 +34,9 @@ cache.Lock("reports:rebuild", 10*time.Minute)
 The TTL is the deadlock ceiling. If the holder crashes, is OOM-killed, or loses the network, the
 lock frees itself when the TTL expires — otherwise a dead process would block the work forever.
 
-:::danger[A zero or negative TTL never expires]
-The parameter is required but not validated. `Lock("job", 0)` and a negative duration both produce a
-lock with no expiry at all — the driver only sets one when the TTL is greater than zero. Acquire one
-and let the holder crash, and every later `Acquire` returns `false` forever: the exact deadlock this
-section exists to prevent. Pass a real, positive TTL.
-:::
+A zero or negative TTL is rejected: `Acquire`, `Block` and `Do` all return `ErrLockTTL` rather than
+taking a lock that would never expire. Without that check, one crashed holder would block the work
+forever — the exact deadlock this section exists to prevent.
 
 Set it comfortably longer than the work takes. Too short and a slow run loses its lock while still
 working; too long and a crash blocks everyone for that long. If the job normally takes two minutes,
