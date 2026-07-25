@@ -18,8 +18,8 @@ cache, err := gocache.New(
 )
 ```
 
-`New` takes a `redis.UniversalClient`, so a single node, a cluster or a sentinel setup all work
-unchanged.
+`New` takes a `redis.UniversalClient`, so a single node, a sentinel setup or a cluster all work
+unchanged. See [Cluster](#cluster) for the two operations that route differently there.
 
 ## The client is yours
 
@@ -47,6 +47,35 @@ defer func() { _ = cache.Close() }()
 Two details worth knowing. Lock release runs as a Lua script so the compare and the delete are
 atomic — that is what makes [owner tokens](/features/locks) safe. And prefix clearing escapes glob
 metacharacters, so a key containing `*` cannot widen the match and delete unrelated keys.
+
+## Cluster
+
+Every operation is supported on a `*redis.ClusterClient`, including the two multi-key ones. They
+route differently there, and knowing how explains their cost.
+
+**Deleting many keys** — `DeleteMany`, and the deletes a `Clear` issues for the keys it finds —
+cannot use one `DEL` on a cluster, because a multi-key command whose keys fall in different hash
+slots is rejected with `CROSSSLOT`. Cache keys are spread across slots by design, so the driver
+pipelines one `DEL` per key instead and lets go-redis split the pipeline across the nodes that own
+them. Same batches of 500, one round trip per node per batch rather than one round trip in total.
+On a single node the batched `DEL` is kept.
+
+**Clearing a prefix** — a cluster client offers no cluster-wide `SCAN`: a `SCAN` cursor belongs to
+the node that issued it, and go-redis picks a node per call, so driving one cursor through the
+cluster client walks an arbitrary node's keyspace and quietly misses everything on the others. The
+driver runs the whole cursor loop against every master instead, concurrently, and deletes what each
+one finds through the cluster-aware path above. `Clear` therefore removes the entire prefix, not
+the fraction that lives on one node.
+
+Both use the client you passed, so `MOVED` redirects and resharding are handled the way go-redis
+normally handles them.
+
+A `*redis.Ring` — client-side sharding across independent Redis servers, with no cluster protocol —
+is supported the same way and for the same reason: its `SCAN` would otherwise land on a shard chosen
+by hashing the cursor, and its multi-key `DEL` would silently delete only the keys living on the
+shard that owns the first one. The driver fans out over `ForEachShard` and pipelines deletes per
+key. Note that a Ring keeps no replicas: a shard that is down is skipped, so a clear that runs
+during an outage leaves that shard's keys behind and still reports success.
 
 ## Clearing
 
@@ -111,6 +140,10 @@ build tag — real Redis matters because miniredis does run the lock's script on
 `redis.call` inside it dispatches into miniredis's own reimplementation of each command rather than
 Redis's actual Lua sandbox. What it emulates is Redis, not Lua, and the lock release script depends
 on the real thing.
+
+miniredis cannot emulate a cluster either, so the cluster paths run in CI against a real
+three-master cluster started with docker, and the sharded paths additionally run as unit tests
+through a `*redis.Ring` spread over several miniredis servers.
 
 For your own tests, prefer the [memory driver](/drivers/memory) and keep Redis for integration
 tests.

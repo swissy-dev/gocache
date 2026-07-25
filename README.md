@@ -511,7 +511,9 @@ GOCACHE_TEST_POSTGRES=... make integration    # real Postgres/MySQL/Redis
 ```
 
 Integration tests skip unless their DSN is set: `GOCACHE_TEST_POSTGRES`, `GOCACHE_TEST_MYSQL`,
-`GOCACHE_TEST_REDIS`.
+`GOCACHE_TEST_REDIS`, and `GOCACHE_TEST_REDIS_CLUSTER` — the last one holding comma-separated node
+addresses, which CI supplies from a three-master cluster it starts with docker. miniredis cannot
+emulate a cluster, so that suite is the only automated coverage of the driver's cluster paths.
 
 ## License
 

@@ -23,6 +23,14 @@ end
 return 0
 `)
 
+type clusterClient interface {
+	ForEachMaster(ctx context.Context, fn func(ctx context.Context, client *redis.Client) error) error
+}
+
+type ringClient interface {
+	ForEachShard(ctx context.Context, fn func(ctx context.Context, client *redis.Client) error) error
+}
+
 type Driver struct {
 	client redis.UniversalClient
 }
@@ -66,12 +74,40 @@ func (d *Driver) Delete(ctx context.Context, key string) (bool, error) {
 }
 
 func (d *Driver) DeleteMany(ctx context.Context, keys []string) error {
+	if err := d.deleteMany(ctx, keys); err != nil {
+		return fmt.Errorf("redisdriver: delete many: %w", err)
+	}
+	return nil
+}
+
+func (d *Driver) deleteMany(ctx context.Context, keys []string) error {
+	sharded := d.sharded()
 	for chunk := range slices.Chunk(keys, deleteBatch) {
+		if sharded {
+			if _, err := d.client.Pipelined(ctx, func(p redis.Pipeliner) error {
+				for _, key := range chunk {
+					p.Del(ctx, key)
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := d.client.Del(ctx, chunk...).Err(); err != nil {
-			return fmt.Errorf("redisdriver: delete many: %w", err)
+			return err
 		}
 	}
 	return nil
+}
+
+func (d *Driver) sharded() bool {
+	switch d.client.(type) {
+	case clusterClient, ringClient:
+		return true
+	default:
+		return false
+	}
 }
 
 func (d *Driver) DeleteIfEquals(ctx context.Context, key string, value []byte) (bool, error) {
@@ -84,13 +120,34 @@ func (d *Driver) DeleteIfEquals(ctx context.Context, key string, value []byte) (
 
 func (d *Driver) ClearPrefix(ctx context.Context, prefix string) error {
 	match := escapeGlob(prefix) + "*"
+	sweep := func(ctx context.Context, node *redis.Client) error {
+		return d.clearNode(ctx, node, match)
+	}
+	switch c := d.client.(type) {
+	case clusterClient:
+		if err := c.ForEachMaster(ctx, sweep); err != nil {
+			return fmt.Errorf("redisdriver: cluster clear prefix: %w", err)
+		}
+	case ringClient:
+		if err := c.ForEachShard(ctx, sweep); err != nil {
+			return fmt.Errorf("redisdriver: ring clear prefix: %w", err)
+		}
+	default:
+		if err := d.clearNode(ctx, d.client, match); err != nil {
+			return fmt.Errorf("redisdriver: clear prefix: %w", err)
+		}
+	}
+	return nil
+}
+
+func (d *Driver) clearNode(ctx context.Context, node redis.Cmdable, match string) error {
 	var cursor uint64
 	for {
-		keys, next, err := d.client.Scan(ctx, cursor, match, scanCount).Result()
+		keys, next, err := node.Scan(ctx, cursor, match, scanCount).Result()
 		if err != nil {
-			return fmt.Errorf("redisdriver: scan: %w", err)
+			return err
 		}
-		if err := d.DeleteMany(ctx, keys); err != nil {
+		if err := d.deleteMany(ctx, keys); err != nil {
 			return err
 		}
 		cursor = next
