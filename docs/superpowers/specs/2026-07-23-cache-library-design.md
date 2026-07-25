@@ -157,7 +157,7 @@ type Driver interface {
 
 ### Memory driver
 
-Map + `container/list` LRU guarded by a `sync.Mutex` (`Get` mutates recency order, so `RWMutex` buys nothing). `WithMaxEntries` option (default 10 000). Expired entries evicted lazily on access and during capacity eviction. The driver copies value bytes on `Set`; bytes returned by `Get` are read-only by contract (the core never mutates driver-returned bytes — its `json.RawMessage` aliases them).
+Map + `container/list` LRU guarded by a `sync.Mutex` (`Get` mutates recency order, so `RWMutex` buys nothing). `WithMaxEntries` option (default 10 000). Expired entries evicted lazily on access, and reclaimed during capacity eviction by scanning a small fixed window at the cold end of the LRU list before falling back to evicting the tail. The window is bounded so eviction stays constant-time: a full-list scan would make every write O(n) under the driver's lock. The driver copies value bytes on `Set`; bytes returned by `Get` are read-only by contract (the core never mutates driver-returned bytes — its `json.RawMessage` aliases them).
 
 ### Redis driver
 
