@@ -86,12 +86,26 @@ func (d *Driver) set(key string, value []byte, ttl time.Duration) {
 	}
 	el := d.lru.PushFront(&entry{key: key, value: v, expiresAt: exp})
 	d.items[key] = el
+	if len(d.items) > d.maxEntries {
+		d.removeExpired()
+	}
 	for len(d.items) > d.maxEntries {
 		back := d.lru.Back()
 		if back == nil {
 			break
 		}
 		d.remove(back)
+	}
+}
+
+func (d *Driver) removeExpired() {
+	now := time.Now()
+	for el := d.lru.Back(); el != nil; {
+		prev := el.Prev()
+		if el.Value.(*entry).expired(now) {
+			d.remove(el)
+		}
+		el = prev
 	}
 }
 

@@ -50,8 +50,7 @@ gocache/                        core package
 ├── options.go                  Option (constructor) + CallOption (per-call)
 ├── envelope.go                 stored-entry format
 ├── tags.go                     tag-version invalidation
-├── singleflight.go             per-key stampede protection
-├── lifecycle.go                lifecycle context, WaitGroup, Close
+├── lifecycle.go                lifecycle context, WaitGroup, Close, bus handling
 ├── lock.go                     atomic locks
 ├── events.go                   event types + hook
 ├── example/                    runnable usage examples
@@ -115,13 +114,13 @@ Factory signature: `func(ctx context.Context) (T, error)`.
 Two exported option types: `Option` (constructor) and `CallOption` (per-call).
 
 - Constructor: `WithL1`, `WithL2`, `WithBus`, `WithDefaultTTL`, `WithDefaultGrace`, `WithSoftTimeout`, `WithHardTimeout`, `WithCodec`, `WithClock`, `WithEventHook`, `WithLogger`, `WithBusRetryQueueSize`.
-- Per-call: `WithTTL(d)`, `WithTags(...)`, `WithGrace(d)` (0 disables for the call), `WithCallSoftTimeout(d)`, `WithCallHardTimeout(d)`, `WithSkipL1()`, `WithSkipBus()`.
+- Per-call: `WithTTL(d)`, `WithTags(...)`, `WithGrace(d)` (0 disables for the call), `WithCallSoftTimeout(d)`, `WithCallHardTimeout(d)`, `WithSkipL1()` (also removes any existing L1 copy, so the writer cannot serve an older value than its peers), `WithSkipBus()`.
 
 Per-call options override constructor defaults. Defaults: TTL 30 m, grace off, timeouts off.
 
 ### Codec & logging
 
-`WithCodec(codec)` where `Codec` is `Marshal(any) ([]byte, error)` / `Unmarshal([]byte, any) error`; default `encoding/json`. `WithLogger(*slog.Logger)` defaults to `slog.Default()`; pass `nil` to silence. The logger is used only for failures that are swallowed by design (§9): grace hits, best-effort write failures, bus retry exhaustion, recovered panics.
+`WithCodec(codec)` where `Codec` is `Marshal(any) ([]byte, error)` / `Unmarshal([]byte, any) error`; default `encoding/json`. The codec must emit valid JSON, because values are embedded verbatim in a JSON envelope; `New` marshals a probe value and rejects a codec whose output is not valid JSON. `WithLogger(*slog.Logger)` defaults to `slog.Default()`; pass `nil` to silence. The logger is used only for failures that are swallowed by design (§9): grace hits, best-effort write failures, bus retry exhaustion, recovered panics.
 
 ## 4. Driver contract
 
@@ -171,15 +170,15 @@ Accepts a **caller-owned** `*sql.DB`; the driver never configures the pool and i
 Single table (name configurable, default `gocache`):
 
 ```sql
-key        TEXT PRIMARY KEY
+key        TEXT PRIMARY KEY   -- VARBINARY(255) on MySQL, which cannot index a TEXT primary key
 value      BYTEA / BLOB
-expires_at BIGINT NULL      -- unix milliseconds, NULL = forever
--- index on expires_at (sweeper + expiry filters)
+expires_at BIGINT NULL        -- unix milliseconds, NULL = forever
+-- index on expires_at (sweeper + expiry filters); inline in CREATE TABLE on MySQL
 ```
 
 Dialects: `postgres`, `mysql`, `sqlite` (placeholder style + upsert syntax). Expired rows are treated as absent on read and deleted lazily. A background sweeper (`time.NewTicker`, default every 5 m, configurable) deletes expired rows in bounded batches (default 1 000 rows per statement, looping while full batches are deleted), each pass under its own timeout on a context derived from the driver's lifecycle and canceled by `Close`, which joins the goroutine before returning.
 
-Schema setup: `Migrate(ctx)` is a dev/test convenience; `Schema(dialect) string` exports the DDL so production users apply it through their own migration tooling (golang-migrate, Flyway, CI/CD) under least-privilege credentials. Nothing runs implicitly.
+Schema setup: `Migrate(ctx)` is a dev/test convenience; `(*Driver).Schema() []string` exports the DDL statements so production users apply it through their own migration tooling (golang-migrate, Flyway, CI/CD) under least-privilege credentials. Nothing runs implicitly.
 
 ### Null driver
 
@@ -204,7 +203,7 @@ Every cache entry is stored as JSON:
 
 ### Get
 
-L1 hit and logically fresh → return. Else L2: fresh → backfill L1 (physical TTL recomputed as remaining logical TTL + configured grace) → return. Else miss. `Get` never returns stale values. `Pull` is `Get` followed by delete-through (both tiers + bus) and shares its signature.
+L1 hit and logically fresh → return. Else L2: fresh → backfill L1 (physical TTL recomputed as remaining logical TTL + configured grace) → return. Else miss. When L1 held a stale entry and L2 reports absent, that stale envelope is carried out of the read as a grace candidate — `Get` still treats it as a miss, but `GetOrSet` can serve it under grace. `Get` never returns stale values. `Pull` is `Get` followed by delete-through (both tiers + bus) and shares its signature.
 
 ### GetOrSet
 
@@ -233,7 +232,7 @@ Write-through or delete-through: L2 first, then L1, then bus publish. `Clear` = 
 
 ### Tags
 
-`DeleteByTag(tag)` writes the current clock timestamp to `__gocache:tag:<tag>` (raw unix-ms value, stored forever) in L2 (or the sole tier) and publishes it on the bus. On read, if an envelope has tags, the stack fetches each tag's timestamp and treats the entry as a miss when `createdAt < tagInvalidatedAt`.
+`DeleteByTag(tag)` writes the current clock timestamp to `__gocache:tag:<tag>` (raw unix-ms value, stored forever) in L2 (or the sole tier) and publishes it on the bus. On read, if an envelope has tags, the stack fetches each tag's timestamp and treats the entry as a miss when `createdAt <= tagInvalidatedAt`, so a write racing an invalidation in the same millisecond loses.
 
 Tag timestamps are cached in L1 with a short TTL (default 10 s, configurable) so lookups are usually local; the bus makes invalidation immediate, and the short TTL bounds staleness to ~10 s even with the bus down. Untagged entries never touch tag keys.
 
@@ -276,14 +275,15 @@ Invariant: **`err != nil` ⇒ the returned value is the zero value and must not 
   - Factory succeeded but the cache write failed: the value is returned with nil error; `EventWriteFailed` carries the write error and the logger records it.
 - Wrapping policy: library sentinels and `context.Canceled`/`context.DeadlineExceeded` always traverse via `%w`. Underlying driver errors are also wrapped for debuggability, but matching driver-internal errors (e.g. go-redis types) is documented as unsupported API — only gocache sentinels are stable.
 - Independent multi-tier failures (`Delete`, `Clear`, `Close` touching L1+L2+bus) are combined with `errors.Join`.
-- Exported sentinels: `ErrClosed`, `ErrLockTimeout`, `ErrLockHeld`. Error strings are package-prefixed lowercase (`"gocache: ..."`).
+- Exported sentinels: `ErrClosed`, `ErrLockTimeout`, `ErrLockHeld`, `ErrLockTTL`. Error strings are package-prefixed lowercase (`"gocache: ..."`). Driver errors are wrapped for debuggability, but only these sentinels (plus `context.Canceled` / `context.DeadlineExceeded`) are a stable matching surface.
+- Two further failures are swallowed by design beyond the two above: `GetOrSet` returns its value with a nil error when the cache write fails (`EventWriteFailed`), and the best-effort L1 delete behind `WithSkipL1` is logged rather than returned.
 - All operations take `ctx` and respect cancellation.
 
 ## 10. Lifecycle and panic policy
 
 - `New` creates an internal lifecycle context; every background goroutine (bus subscriber, bus retry drainer, SQL sweeper, in-flight detached factories) is tracked by a `sync.WaitGroup`.
 - `Close` is idempotent (`sync.Once`; second call returns nil): stop accepting operations → cancel the lifecycle context → join all background goroutines → close bus → close drivers (`errors.Join` on failures). Operations after `Close` return `ErrClosed`; a detached factory completing after `Close` discards its write and fires `EventWriteFailed`.
-- Panic policy: panics are recovered at every internally-spawned goroutine boundary (flight, subscriber, drainer, sweeper) and converted to errors/events + log — the library never crashes the host process. `lock.Do` releases the lock via `defer` and re-panics after release. Event-hook panics are recovered and logged.
+- Panic policy: panics are recovered at every internally-spawned goroutine boundary (flight, subscriber, drainer, sweeper) and converted to errors/events + log. The flight and drainer are tracked by the cache's own WaitGroup; the subscriber and sweeper are owned and joined by the bus and driver, which `Close` shuts down in turn — the library never crashes the host process. `lock.Do` releases the lock via `defer` and re-panics after release. Event-hook panics are recovered and logged.
 
 ## 11. Atomic locks
 
@@ -299,7 +299,7 @@ err = lock.ForceRelease(ctx)
 - Each `Lock` value holds a crypto/rand owner token. `Release` deletes via `DeleteIfEquals(key, token)` — a lock re-acquired by someone else after TTL expiry cannot be released by the old holder.
 - `Acquire` → driver `Add` with the lock TTL. `Block` retries with jittered backoff (default 50–250 ms, `time.NewTimer`+`Reset`, select on `ctx.Done()`) until acquired, ctx canceled, or timeout → `ErrLockTimeout`. `Do` = acquire (`ErrLockHeld` if taken), run, release via `defer` (runs on panic too).
 - Lock keys: `__gocache:lock:<namespaced name>`, stored on L2 when present (distributed), else the sole driver. Locks bypass L1, envelopes, tags, and the bus.
-- TTL is the deadlock ceiling: a crashed holder's lock frees itself at expiry.
+- TTL is the deadlock ceiling: a crashed holder's lock frees itself at expiry. A zero or negative TTL is rejected with `ErrLockTTL` rather than taking a lock that would never expire.
 - Documented caveat (same as Laravel): `Clear` on the root cache wipes lock keys too.
 
 ## 12. Events
@@ -308,13 +308,15 @@ Concrete event structs delivered synchronously to an optional hook (`WithEventHo
 
 `EventHit`, `EventMiss`, `EventWritten`, `EventDeleted`, `EventCleared`, `EventTagInvalidated`, `EventGraceHit` (carries factory error), `EventFactoryError`, `EventWriteFailed` (carries write error), `EventBusPublishFailed`, `EventBusMessageReceived`, `EventLockAcquired`, `EventLockReleased`.
 
-Each event carries the fully-prefixed key(s) where applicable plus the relevant tier (`L1`/`L2`).
+Each event carries the fully-prefixed key(s) where applicable. `EventHit` and `EventWritten` also carry the tier (`L1`/`L2`); the others have no meaningful tier.
 
 ## 13. Testing
 
+**Status note (post-implementation).** This spec has been trued up against what shipped: the three behaviour changes in `fix: close three silent-failure gaps and add CI` are reflected above, and several claims that overpromised — a tier on every event, the null driver running the conformance suite, in-memory SQLite — have been corrected to describe the code as built.
+
 - **Injected clock:** `WithClock(func() time.Time)`; all TTL/grace/tag comparisons read it — deterministic expiry math everywhere, including conformance runs against real backends.
 - **`testing/synctest`** (Go 1.25) for everything driven by real timers that the injected clock can't reach: soft/hard timeout orchestration, singleflight waiter cancellation, detached-factory completion, lock `Block` backoff, retry-queue backoff.
-- **Conformance suite** (`driver/drivertest`, imports `gocache`): exported functions asserting Get/Set/TTL/Add/DeleteIfEquals/ClearPrefix semantics, run by every driver. Default runs: memory and null directly, Redis via miniredis, SQL via in-memory SQLite (validates the sqlite dialect only).
+- **Conformance suite** (`driver/drivertest`, imports `gocache`): exported functions asserting Get/Set/TTL/Add/DeleteIfEquals/ClearPrefix semantics, run by every driver. Default runs: memory directly, Redis via miniredis, SQL via a file-backed temporary SQLite database (`:memory:` is per-connection in modernc.org/sqlite, so it cannot serve a multi-connection pool). The null driver cannot satisfy the suite — it stores nothing, so read-back and `Add` semantics do not apply — and has its own targeted test instead.
 - **Integration tests** behind `//go:build integration` (env vars supply DSNs only: `GOCACHE_TEST_REDIS`, `GOCACHE_TEST_POSTGRES`, `GOCACHE_TEST_MYSQL`): the same suite against real Redis, Postgres, and MySQL — the postgres and mysql dialects have no coverage otherwise, so CI must run this tag before release.
 - **Core tests:** memory drivers as L1+L2 plus memorybus with the fake clock — tier read/write/backfill, grace serving, tag invalidation, namespace isolation, envelope round-trips.
 - **Stampede test:** N concurrent goroutines on one key assert exactly one factory execution.

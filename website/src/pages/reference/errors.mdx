@@ -45,8 +45,10 @@ error is recoverable from a `GetOrSet` failure. A recovered factory **panic** is
 knowing: it is formatted with `%v`, not `%w`, so an `error` panic value cannot be found with
 `errors.Is` or `errors.As` afterward — only its text survives.
 
-Only gocache's own sentinels are a stable API. Driver errors are wrapped for debuggability, but
-matching on a driver's internal error types is not supported and may break when you swap drivers.
+Only gocache's own sentinels are a stable API. Driver errors are wrapped with `%w` so you can
+inspect them while debugging, but matching a driver's internal error types — `redis.Nil`, a pgx
+error code — is explicitly unsupported and will break when you swap drivers. Treat everything below
+the sentinels as opaque.
 
 ## Failures gocache does not return
 

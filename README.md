@@ -451,6 +451,13 @@ value with a **nil error** even though the write didn't happen — the same fail
 failed `Release` the same way, but only to the logger; there's no event for it. Sentinels:
 `ErrClosed`, `ErrLockTimeout`, `ErrLockHeld`, `ErrLockTTL`.
 
+Only gocache's own sentinels are a stable API. Driver errors are wrapped with `%w` so you can
+inspect them while debugging, but matching a driver's internal error types — `redis.Nil`, a pgx
+error code — is explicitly unsupported and will break when you swap drivers. Match `ErrClosed`,
+`ErrLockHeld`, `ErrLockTimeout`, `ErrLockTTL`, `context.Canceled` and `context.DeadlineExceeded`;
+treat everything below that as opaque.
+
+
 ### Drivers
 
 | Driver | Package | Notes |

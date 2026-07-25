@@ -111,6 +111,7 @@ func (c *Cache) enqueueRetry(msg []byte) {
 		select {
 		case <-c.rt.retryQ:
 			c.emit(EventBusPublishFailed{Dropped: true})
+			c.logf("bus retry queue full, dropped the oldest message")
 		default:
 		}
 	}
@@ -140,6 +141,7 @@ func (c *Cache) drainRetries() {
 				break
 			}
 			c.emit(EventBusPublishFailed{Err: err})
+			c.logf("bus publish retry failed", "err", err, "retry_in", delay)
 			delay = min(delay*2, 5*time.Second)
 			t := time.NewTimer(delay)
 			select {
