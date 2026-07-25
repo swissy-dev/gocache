@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-23
 **Status:** Approved design, pending implementation (revised after golang-skills review)
-**Module:** `github.com/octoper/gocache` · Go 1.25
+**Module:** `github.com/swissy-dev/gocache` · Go 1.25
 
 ## 1. Overview
 
@@ -41,7 +41,7 @@ Layered core with dumb drivers (bentocache's own shape):
 
 ```
 gocache/                        core package
-├── go.mod                      module github.com/octoper/gocache
+├── go.mod                      module github.com/swissy-dev/gocache
 ├── README.md · LICENSE · .gitignore · .golangci.yml · Makefile
 ├── cache.go                    Cache type, New(), management methods
 ├── driver.go                   Driver interface (consumed here)
