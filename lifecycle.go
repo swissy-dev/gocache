@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/semaphore"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -22,6 +23,7 @@ type runtime struct {
 	closed    atomic.Bool
 	closeErr  error
 	sf        singleflight.Group
+	flights   *semaphore.Weighted
 	origin    string
 	retryQ    chan []byte
 	fence     invalidationFence

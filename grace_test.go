@@ -3,6 +3,8 @@ package gocache
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -157,6 +159,107 @@ func TestHardTimeoutCancelsFactory(t *testing.T) {
 		})
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+func TestSoftTimeoutServesStaleWhileWaitingForAFactorySlot(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clk := newFakeClock()
+		c, err := New(
+			WithL1(memory.New()),
+			WithClock(clk.Now),
+			WithDefaultGrace(time.Hour),
+			WithSoftTimeout(50*time.Millisecond),
+			WithMaxConcurrentFactories(1),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = c.Close() }()
+		staleEntry(t, c, clk)
+
+		release := make(chan struct{})
+		releaseAll := sync.OnceFunc(func() { close(release) })
+		defer releaseAll()
+		held := make(chan error, 1)
+		go func() {
+			_, err := GetOrSet(context.Background(), c, "holder", func(context.Context) (user, error) {
+				<-release
+				return user{Name: "holder"}, nil
+			})
+			held <- err
+		}()
+		synctest.Wait()
+
+		start := time.Now()
+		v, err := GetOrSet(context.Background(), c, "k", func(context.Context) (user, error) {
+			<-release
+			return user{Name: "fresh"}, nil
+		})
+		if err != nil || v.Name != "stale" {
+			t.Fatalf("v=%+v err=%v", v, err)
+		}
+		if d := time.Since(start); d != 50*time.Millisecond {
+			t.Fatalf("soft timeout fired after %v", d)
+		}
+
+		releaseAll()
+		synctest.Wait()
+		if err := <-held; err != nil {
+			t.Fatal(err)
+		}
+		got, ok, err := Get[user](context.Background(), c, "k")
+		if err != nil || !ok || got.Name != "fresh" {
+			t.Fatalf("the queued refresh never completed: got=%+v ok=%v err=%v", got, ok, err)
+		}
+	})
+}
+
+func TestDefaultHardTimeoutCancelsAnUnconfiguredFactory(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c, err := New(WithL1(memory.New()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = c.Close() }()
+		start := time.Now()
+		_, err = GetOrSet(context.Background(), c, "k", func(fctx context.Context) (user, error) {
+			select {
+			case <-fctx.Done():
+				return user{}, fctx.Err()
+			case <-time.After(time.Hour):
+				return user{Name: "never"}, nil
+			}
+		})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err = %v, want a deadline error from the default hard timeout", err)
+		}
+		if d := time.Since(start); d != defaultHardTimeout {
+			t.Fatalf("the factory ran for %v, want the %v default hard timeout", d, defaultHardTimeout)
+		}
+	})
+}
+
+func TestZeroHardTimeoutDisablesTheDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c, err := New(WithL1(memory.New()), WithHardTimeout(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = c.Close() }()
+		v, err := GetOrSet(context.Background(), c, "k", func(fctx context.Context) (user, error) {
+			if deadline, ok := fctx.Deadline(); ok {
+				return user{}, fmt.Errorf("factory context carries a deadline at %v", deadline)
+			}
+			time.Sleep(2 * defaultHardTimeout)
+			if fctx.Err() != nil {
+				return user{}, fctx.Err()
+			}
+			return user{Name: "slow"}, nil
+		})
+		if err != nil || v.Name != "slow" {
+			t.Fatalf("v=%+v err=%v", v, err)
 		}
 	})
 }

@@ -38,6 +38,21 @@ func TestNewRejectsNegativeDurations(t *testing.T) {
 	}
 }
 
+func TestNewRejectsNegativeHardTimeout(t *testing.T) {
+	if _, err := New(WithL1(memory.New()), WithHardTimeout(-time.Second)); err == nil {
+		t.Fatal("expected error for negative hard timeout")
+	}
+}
+
+func TestNewRejectsNonPositiveMaxConcurrentFactories(t *testing.T) {
+	if _, err := New(WithL1(memory.New()), WithMaxConcurrentFactories(0)); err == nil {
+		t.Fatal("expected error for a zero factory limit")
+	}
+	if _, err := New(WithL1(memory.New()), WithMaxConcurrentFactories(-1)); err == nil {
+		t.Fatal("expected error for a negative factory limit")
+	}
+}
+
 func TestNewRejectsZeroTagCacheTTL(t *testing.T) {
 	if _, err := New(WithL1(memory.New()), WithTagCacheTTL(0)); err == nil {
 		t.Fatal("expected error for zero tag cache ttl")

@@ -3,6 +3,7 @@ package gocache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -252,6 +253,9 @@ func GetOrSet[T any](ctx context.Context, c *Cache, key string, factory func(con
 				c.logf("grace hit", "key", k, "err", r.Err)
 				return decodeValue[T](c, res.env)
 			}
+			if errors.Is(r.Err, ErrFactoryLimit) || errors.Is(r.Err, ErrClosed) {
+				return zero, r.Err
+			}
 			return zero, fmt.Errorf("gocache: factory: %w", r.Err)
 		}
 		v, ok := r.Val.(T)
@@ -295,6 +299,15 @@ func (c *Cache) runFlight(callerCtx context.Context, fullKey string, factory fun
 		fctx, tcancel = context.WithTimeout(fctx, o.hard)
 		defer tcancel()
 	}
+	if aerr := c.rt.flights.Acquire(fctx, 1); aerr != nil {
+		if c.rt.closed.Load() {
+			return nil, ErrClosed
+		}
+		serr := fmt.Errorf("%w: %w", ErrFactoryLimit, aerr)
+		c.emit(EventFactoryError{Key: fullKey, Err: serr})
+		return nil, serr
+	}
+	defer c.rt.flights.Release(1)
 	val, ferr := factory(fctx)
 	if ferr != nil {
 		c.emit(EventFactoryError{Key: fullKey, Err: ferr})

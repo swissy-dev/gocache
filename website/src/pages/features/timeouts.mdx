@@ -12,7 +12,9 @@ cache, err := gocache.New(
 )
 ```
 
-Both are off by default.
+The soft timeout is off by default. The hard timeout defaults to **30 seconds** — a backstop, not a
+latency control, chosen to be well past any legitimate network-backed factory while still bounding
+how long a stuck one can run. Pass `WithHardTimeout(0)` to remove the bound entirely.
 
 ## Soft timeout
 
@@ -41,8 +43,18 @@ nothing to return early and the caller waits for the factory.
 The hard timeout cancels the factory's context outright:
 
 ```go
-gocache.WithHardTimeout(5 * time.Second)
+gocache.WithHardTimeout(5 * time.Second)   // tighter than the 30s default
+gocache.WithHardTimeout(0)                 // no bound at all
 ```
+
+Unlike grace and the soft timeout, this one is **on by default at 30 seconds**. An unconfigured
+cache cannot run a factory forever, because a factory that never finishes holds a goroutine, a
+backend connection and a [concurrency slot](/features/get-or-set) for as long as it lasts. Zero is
+the explicit opt-out, not the unset state: if you have a factory that legitimately runs for minutes,
+raise the bound or lift it per call rather than leaving it unset.
+
+The bound covers the whole flight, not just the factory body — including any time the flight spends
+waiting for a concurrency slot.
 
 Your factory should respect its context; if it does, the call fails with a deadline error at the
 limit — unless grace is configured and a stale copy is available within its window, in which case
@@ -81,6 +93,9 @@ report, err := gocache.GetOrSet(ctx, cache, "report:annual", buildReport,
 The names differ from the constructor options because Go does not overload — `WithSoftTimeout`
 configures the cache, `WithCallSoftTimeout` configures one call.
 
+`WithCallHardTimeout(0)` lifts the bound for that one call — the right tool for the rare report that
+is genuinely allowed to take as long as it takes.
+
 ## Choosing values
 
 **Soft timeout** should be a little above the normal latency of the factory. Set it at your p50 and
@@ -88,7 +103,9 @@ you will serve stale data half the time; set it at your p95 and it engages only 
 genuinely wrong.
 
 **Hard timeout** should be above the worst legitimate duration of the work. It is a backstop against
-a hung dependency, not a latency control — that is the soft timeout's job.
+a hung dependency, not a latency control — that is the soft timeout's job. The 30-second default is
+deliberately generous; tighten it if your factories are all sub-second and you want a stuck one
+reaped sooner.
 
 Neither replaces a deadline on the caller's own context. If your HTTP handler has a two-second
 budget, put that on `ctx` and let the caller's cancellation cut its own wait short.
@@ -96,8 +113,16 @@ budget, put that on `ctx` and let the caller's cancellation cut its own wait sho
 ## Interaction with Close
 
 A background factory left running by a soft timeout is tracked by the cache. `Close` waits for it —
-so a shutdown can block for as long as that factory takes, bounded by the hard timeout if you set
-one. If it finishes after `Close`, its write is discarded and reported as `EventWriteFailed`.
+so a shutdown can block for as long as that factory takes, bounded by the hard timeout. Two things
+make that bound real: there can never be more than
+[`WithMaxConcurrentFactories`](/features/get-or-set) factories running, and each of them is capped
+at the hard timeout. Flights still queueing for a slot are released the moment `Close` cancels the
+cache context, so they do not extend shutdown at all. If a factory finishes after `Close`, its write
+is discarded and reported as `EventWriteFailed`.
 
-This is one of the better reasons to configure a hard timeout in a service that needs to shut down
+The bound only holds for factories that respect their context: cancellation is advisory, so a
+factory that ignores `ctx` still blocks `Close` for as long as it likes — at most
+`WithMaxConcurrentFactories` of them at a time.
+
+This is one of the better reasons to tighten the hard timeout in a service that needs to shut down
 promptly.

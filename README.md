@@ -284,7 +284,7 @@ your `Release` can't delete their lock — and once a lease ends its token is re
 
 ## Surviving a bad day
 
-Two independent settings, both off by default.
+Two independent settings. Grace is off by default; of the two timeouts, only the soft one is.
 
 **Grace** — when the database your factory reads from is down, serve stale data rather than
 failing:
@@ -311,6 +311,20 @@ gocache.WithHardTimeout(5 * time.Second)
 Past the soft timeout, a waiting caller gets the stale copy immediately while the factory keeps
 running in the background and stores its result when it finishes. The hard timeout cancels the
 factory's context outright. Soft timeouts need grace to have something to serve.
+
+The hard timeout defaults to 30 seconds, so an unconfigured cache can never run a factory forever;
+`WithHardTimeout(0)` removes the bound if you want that.
+
+**A ceiling on factory work** — when a flood of distinct cold keys would otherwise put one factory
+per key on your database:
+
+```go
+gocache.WithMaxConcurrentFactories(200)   // default 1024
+```
+
+The slot belongs to the flight, so many callers on one key still cost one slot. Past the ceiling a
+new flight waits for a slot rather than failing, and the caller keeps its own `ctx` deadline, its
+soft timeout and its grace fallback while it waits.
 
 ## Watching what it does
 
@@ -412,16 +426,19 @@ Notes:
 ### Options
 
 Constructor: `WithL1`, `WithL2`, `WithBus`, `WithKeyPrefix`, `WithDefaultTTL`, `WithDefaultGrace`,
-`WithSoftTimeout`, `WithHardTimeout`, `WithTagCacheTTL`, `WithCodec`, `WithClock`, `WithEventHook`,
-`WithLogger`, `WithBusRetryQueueSize`.
+`WithSoftTimeout`, `WithHardTimeout`, `WithMaxConcurrentFactories`, `WithTagCacheTTL`, `WithCodec`,
+`WithClock`, `WithEventHook`, `WithLogger`, `WithBusRetryQueueSize`.
 
 Per call: `WithTTL`, `WithTags`, `WithGrace`, `WithCallSoftTimeout`, `WithCallHardTimeout`,
 `WithSkipL1`, `WithSkipBus`.
 
-Defaults: key prefix `gocache`, TTL 30 minutes, grace off, timeouts off, tag-cache TTL 10 seconds, JSON
-codec, `slog.Default()`, bus retry queue 1024. `New` validates its options and returns an error rather
-than failing later — a cache with no tier, a bus without both tiers, a nil driver, a negative duration or
-an empty key prefix are all rejected at construction.
+Defaults: key prefix `gocache`, TTL 30 minutes, grace off, soft timeout off, hard timeout 30 seconds,
+1024 concurrent factories, tag-cache TTL 10 seconds, JSON codec, `slog.Default()`, bus retry queue 1024.
+`New` validates its options and returns an error rather than failing later — a cache with no tier, a bus
+without both tiers, a nil driver, a negative duration, a factory limit below 1 or an empty key prefix are
+all rejected at construction.
+
+`WithHardTimeout(0)` means *no* hard timeout; the default is 30 seconds, so zero has to be asked for.
 
 `WithKeyPrefix(s)` replaces the leading `gocache` segment, letting two applications share one Redis logical
 database without seeing, overwriting or clearing each other's entries.
@@ -445,13 +462,13 @@ cache write failure after the factory has already succeeded. That last one retur
 value with a **nil error** even though the write didn't happen — the same failure through plain
 `Set` is returned as an error — so `EventWriteFailed` is the signal to watch. `Lock.Do` swallows a
 failed `Release` the same way, but only to the logger; there's no event for it. Sentinels:
-`ErrClosed`, `ErrLockTimeout`, `ErrLockHeld`, `ErrLockTTL`.
+`ErrClosed`, `ErrFactoryLimit`, `ErrLockTimeout`, `ErrLockHeld`, `ErrLockTTL`.
 
 Only gocache's own sentinels are a stable API. Driver errors are wrapped with `%w` so you can
 inspect them while debugging, but matching a driver's internal error types — `redis.Nil`, a pgx
 error code — is explicitly unsupported and will break when you swap drivers. Match `ErrClosed`,
-`ErrLockHeld`, `ErrLockTimeout`, `ErrLockTTL`, `context.Canceled` and `context.DeadlineExceeded`;
-treat everything below that as opaque.
+`ErrFactoryLimit`, `ErrLockHeld`, `ErrLockTimeout`, `ErrLockTTL`, `context.Canceled` and
+`context.DeadlineExceeded`; treat everything below that as opaque.
 
 
 ### Drivers

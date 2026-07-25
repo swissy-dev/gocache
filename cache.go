@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"golang.org/x/sync/semaphore"
 )
 
 type Cache struct {
@@ -24,10 +26,11 @@ func New(opts ...Option) (*Cache, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	rt := &runtime{
-		ctx:    ctx,
-		cancel: cancel,
-		origin: newOrigin(),
-		retryQ: make(chan []byte, cfg.busQueue),
+		ctx:     ctx,
+		cancel:  cancel,
+		flights: semaphore.NewWeighted(int64(cfg.maxFactories)),
+		origin:  newOrigin(),
+		retryQ:  make(chan []byte, cfg.busQueue),
 	}
 	c := &Cache{cfg: cfg, rt: rt}
 	if cfg.bus != nil {

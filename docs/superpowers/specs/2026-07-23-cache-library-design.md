@@ -85,7 +85,7 @@ if err != nil { ... }
 defer c.Close()
 ```
 
-`New(opts ...Option) (*Cache, error)` validates at construction and fails on: no tier configured, a bus without both L1 and L2, nil driver/bus, negative durations.
+`New(opts ...Option) (*Cache, error)` validates at construction and fails on: no tier configured, a bus without both L1 and L2, nil driver/bus, negative durations, a factory concurrency limit below 1.
 
 Data operations are package-level generic functions (Go has no generic methods); management operations are methods on `*Cache`.
 
@@ -113,10 +113,12 @@ Factory signature: `func(ctx context.Context) (T, error)`.
 
 Two exported option types: `Option` (constructor) and `CallOption` (per-call).
 
-- Constructor: `WithL1`, `WithL2`, `WithBus`, `WithKeyPrefix`, `WithDefaultTTL`, `WithDefaultGrace`, `WithSoftTimeout`, `WithHardTimeout`, `WithCodec`, `WithClock`, `WithEventHook`, `WithLogger`, `WithBusRetryQueueSize`.
+- Constructor: `WithL1`, `WithL2`, `WithBus`, `WithKeyPrefix`, `WithDefaultTTL`, `WithDefaultGrace`, `WithSoftTimeout`, `WithHardTimeout`, `WithMaxConcurrentFactories`, `WithCodec`, `WithClock`, `WithEventHook`, `WithLogger`, `WithBusRetryQueueSize`.
 - Per-call: `WithTTL(d)`, `WithTags(...)`, `WithGrace(d)` (0 disables for the call), `WithCallSoftTimeout(d)`, `WithCallHardTimeout(d)`, `WithSkipL1()` (also removes any existing L1 copy, so the writer cannot serve an older value than its peers), `WithSkipBus()`.
 
-Per-call options override constructor defaults. Defaults: TTL 30 m, grace off, timeouts off.
+Per-call options override constructor defaults. Defaults: TTL 30 m, grace off, soft timeout off, hard timeout **30 s**, **1024** concurrent factories.
+
+The hard timeout is the one duration that defaults to on: an unconfigured cache must not be able to run a factory forever, because detached flights hold goroutines and backend connections that nothing else bounds. Zero is therefore an explicit "no ceiling" rather than "unset" — `WithHardTimeout(0)` and `WithCallHardTimeout(0)` both disable it, negatives are still rejected.
 
 ### Codec & logging
 
@@ -222,9 +224,9 @@ Reading L2 and writing L1 are separate steps. A mutation completing between them
 
 1. Fast path: fresh hit in L1/L2 → return.
 2. Miss/stale → per-key singleflight (§6a): one flight per key, all concurrent callers — leader included — wait on the flight result while selecting on their own `ctx.Done()`.
-3. The flight runs the factory.
-   - **Soft timeout:** factory exceeds it *and* a graced value exists → the blocked caller returns the stale value now; the flight keeps running and writes on completion.
-   - **Hard timeout:** the flight context is canceled.
+3. The flight takes one of `WithMaxConcurrentFactories` slots (§6a) — waiting for one if they are all taken — and runs the factory.
+   - **Soft timeout:** factory exceeds it *and* a graced value exists → the blocked caller returns the stale value now; the flight keeps running and writes on completion. Time spent waiting for a slot counts here too.
+   - **Hard timeout:** the flight context is canceled. It covers the wait for a slot as well as the factory itself; expiring while queued yields `ErrFactoryLimit`.
 4. Success → envelope → write L2, then L1 → bus-publish invalidation.
 5. Failure → graced value available → return it (see §9) and emit `EventGraceHit`; else return the wrapped factory error.
 
@@ -236,6 +238,14 @@ Flights are **owned by the cache, not by any caller** — this avoids the classi
 - Implementation: `golang.org/x/sync/singleflight` via `DoChan`; every caller selects on the result channel and its own `ctx.Done()`. A caller whose ctx cancels leaves; the flight continues for the others.
 - Flight results are never cached on error (`Forget` on failure); a failed flight's error is delivered to all current waiters.
 - A factory panic is recovered at the flight boundary, converted to an error delivered to all waiters, logged, and emitted as `EventFactoryError` — waiters are never stranded and the process never crashes.
+
+**Bounded concurrency.** Detaching a flight from its caller means caller cancellation cannot shed load, so unique cold keys would otherwise convert directly into unbounded concurrent factory executions — goroutines and backend connections that `Close` then has to join. A `golang.org/x/sync/semaphore` of `WithMaxConcurrentFactories` slots (default 1024) bounds them:
+
+- **Acquired inside the flight, not per caller.** A slot is taken after the flight context is built and before the factory runs, so many callers joining one flight consume one slot between them and deduplication is untouched. What this bounds is concurrent factory *executions* — the backend load. It does not bound the number of *pending* flights: a flood of distinct keys still parks one goroutine per key on the semaphore, holding no connection and living no longer than the hard timeout.
+- **Waiting, not failing.** The acquire blocks on the flight context. Callers keep every escape they already had — their own `ctx.Done()`, the soft timeout serving stale, grace catching the eventual failure — so a saturated cache degrades into backpressure rather than an error storm that pushes every caller onto the backend directly.
+- **Bounded by the hard timeout.** The acquire runs under the hard-timeout context, so queueing counts against the same ceiling as execution. A flight that never gets a slot fails with `ErrFactoryLimit` wrapping the context error; if the cache is closing, it returns `ErrClosed` instead of blaming saturation.
+- **Released on every path**, including panic recovery (the release is deferred inside the flight, so it runs before the recovering defer) and cancellation. The early `ErrClosed` return happens before the acquire, so there is nothing to release.
+- **Shutdown.** `Close` cancels the runtime context, which frees every queued flight immediately; what remains is at most `WithMaxConcurrentFactories` running factories, each capped at the hard timeout. Shutdown is bounded for context-respecting factories, and bounded in *count* even for those that ignore cancellation.
 
 ### Set / Delete / DeleteMany / Clear
 
@@ -308,14 +318,14 @@ Invariant: **`err != nil` ⇒ the returned value is the zero value and must not 
   - Factory succeeded but the cache write failed: the value is returned with nil error; `EventWriteFailed` carries the write error and the logger records it.
 - Wrapping policy: library sentinels and `context.Canceled`/`context.DeadlineExceeded` always traverse via `%w`. Underlying driver errors are also wrapped for debuggability, but matching driver-internal errors (e.g. go-redis types) is documented as unsupported API — only gocache sentinels are stable.
 - Independent multi-tier failures (`Delete`, `Clear`, `Close` touching L1+L2+bus) are combined with `errors.Join`.
-- Exported sentinels: `ErrClosed`, `ErrLockTimeout`, `ErrLockHeld`, `ErrLockTTL`. Error strings are package-prefixed lowercase (`"gocache: ..."`). Driver errors are wrapped for debuggability, but only these sentinels (plus `context.Canceled` / `context.DeadlineExceeded`) are a stable matching surface.
+- Exported sentinels: `ErrClosed`, `ErrFactoryLimit`, `ErrLockTimeout`, `ErrLockHeld`, `ErrLockTTL`. Error strings are package-prefixed lowercase (`"gocache: ..."`). Driver errors are wrapped for debuggability, but only these sentinels (plus `context.Canceled` / `context.DeadlineExceeded`) are a stable matching surface.
 - Two further failures are swallowed by design beyond the two above: `GetOrSet` returns its value with a nil error when the cache write fails (`EventWriteFailed`), and the best-effort L1 delete behind `WithSkipL1` is logged rather than returned.
 - All operations take `ctx` and respect cancellation.
 
 ## 10. Lifecycle and panic policy
 
 - `New` creates an internal lifecycle context; every background goroutine (bus subscriber, bus retry drainer, SQL sweeper, in-flight detached factories) is tracked by a `sync.WaitGroup`.
-- `Close` is idempotent (`sync.Once`; second call returns nil): stop accepting operations → cancel the lifecycle context → join all background goroutines → close bus → close drivers (`errors.Join` on failures). Operations after `Close` return `ErrClosed`; a detached factory completing after `Close` discards its write and fires `EventWriteFailed`.
+- `Close` is idempotent (`sync.Once`; second call returns nil): stop accepting operations → cancel the lifecycle context → join all background goroutines → close bus → close drivers (`errors.Join` on failures). Operations after `Close` return `ErrClosed`; a detached factory completing after `Close` discards its write and fires `EventWriteFailed`. Cancelling the lifecycle context releases every flight queued for a factory slot at once, so the join waits only on factories that are actually running — at most `WithMaxConcurrentFactories` of them, each capped by the hard timeout (§6a).
 - Panic policy: panics are recovered at every internally-spawned goroutine boundary (flight, subscriber, drainer, sweeper) and converted to errors/events + log. The flight and drainer are tracked by the cache's own WaitGroup; the subscriber and sweeper are owned and joined by the bus and driver, which `Close` shuts down in turn — the library never crashes the host process. `lock.Do` releases the lock via `defer` and re-panics after release. Event-hook panics are recovered and logged.
 
 ## 11. Atomic locks
@@ -353,6 +363,7 @@ Each event carries the fully-prefixed key(s) where applicable. `EventHit` and `E
 - **Integration tests** behind `//go:build integration` (env vars supply DSNs only: `GOCACHE_TEST_REDIS`, `GOCACHE_TEST_REDIS_CLUSTER` as comma-separated node addresses, `GOCACHE_TEST_POSTGRES`, `GOCACHE_TEST_MYSQL`): the same suite against real Redis, a real Redis cluster, Postgres, and MySQL — the postgres and mysql dialects and the cluster paths have no coverage otherwise, so CI must run this tag before release. miniredis cannot emulate a cluster, so CI starts a three-master one with docker; that suite also asserts the two defects directly, that a `DeleteMany` spanning hash slots succeeds and that a `ClearPrefix` reaches every master.
 - **Core tests:** memory drivers as L1+L2 plus memorybus with the fake clock — tier read/write/backfill, grace serving, tag invalidation, namespace isolation, envelope round-trips.
 - **Stampede test:** N concurrent goroutines on one key assert exactly one factory execution.
+- **Factory concurrency tests:** under `synctest`, a small `WithMaxConcurrentFactories` with more distinct keys than slots asserts the live-factory peak never exceeds the limit; many callers on one key still cost one slot; a caller queued for a slot observes its own `ctx` cancellation and never runs its factory; a panicking factory gives its slot back; and a saturated cache still serves stale at the soft timeout and completes the queued refresh afterwards.
 - **Multi-instance tests:** two `Cache` values sharing one L2 and one memorybus; writes/deletes/tag-flushes on A must evict B's L1. Lock exclusion across both instances.
 - **Goroutine leaks:** `goleak.VerifyTestMain` in core, `driver/sqldriver`, and bus test packages; explicit test that `Close` reaps every background goroutine, including closing mid-flight during a detached soft-timeout factory.
 - **`go test -race`** everywhere; TDD throughout.
@@ -361,7 +372,7 @@ Each event carries the fully-prefixed key(s) where applicable. `EventHit` and `E
 
 | Dependency | Where | Purpose |
 |---|---|---|
-| `golang.org/x/sync` | core | singleflight |
+| `golang.org/x/sync` | core | singleflight, semaphore |
 | `github.com/redis/go-redis/v9` | `driver/redisdriver`, `bus/redisbus` | Redis client |
 | `github.com/alicebob/miniredis/v2` | tests | in-process Redis |
 | `modernc.org/sqlite` | tests | pure-Go SQLite for the SQL conformance suite |
