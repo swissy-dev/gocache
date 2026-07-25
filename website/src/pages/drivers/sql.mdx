@@ -94,6 +94,14 @@ A separate `*sql.DB` for the cache is worth considering when traffic is signific
 Expired rows are filtered on read, so a stale row is never served. But unlike Redis, nothing removes
 them on its own — hence the sweeper.
 
+Expiry is the database's business, not the client's. A row's `expires_at` is computed inside the
+statement, as the database server's own clock plus the TTL you passed, and every comparison against
+it is evaluated the same way — reads, deletes, the compare-and-delete behind a lock release, the
+expired-row cleanup inside set-if-absent, and the sweeper. No application timestamp is bound into
+those statements, so every instance judges a row against one authoritative clock and skew between
+application servers cannot expire an entry early or keep it alive late. A write with no TTL still
+stores `NULL` and still never expires.
+
 A background goroutine deletes expired rows in bounded batches, every five minutes by default:
 
 ```go
@@ -137,6 +145,10 @@ Defaults to `slog.Default()`. Passing `nil` silences it safely.
 [Atomic locks](/features/locks) work here. Set-if-absent is a transaction that clears an expired
 holder and then inserts, relying on the primary key for atomicity, and release is a
 compare-and-delete on the owner token.
+
+Because the lease's expiry is written and judged by the database server's clock, a lock is safe under
+client clock skew: an instance running fast cannot decide another instance's live lease has lapsed
+and take it, and one running slow does not hold a dead lease past its TTL.
 
 They are as reliable as your database, which is to say considerably more reliable than most caches —
 a lock in a Postgres table survives a restart of everything except Postgres.

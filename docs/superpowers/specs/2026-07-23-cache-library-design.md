@@ -176,7 +176,7 @@ expires_at BIGINT NULL        -- unix milliseconds, NULL = forever
 -- index on expires_at (sweeper + expiry filters); inline in CREATE TABLE on MySQL
 ```
 
-Dialects: `postgres`, `mysql`, `sqlite` (placeholder style + upsert syntax). Expired rows are treated as absent on read and deleted lazily. A background sweeper (`time.NewTicker`, default every 5 m, configurable) deletes expired rows in bounded batches (default 1 000 rows per statement, looping while full batches are deleted), each pass under its own timeout on a context derived from the driver's lifecycle and canceled by `Close`, which joins the goroutine before returning.
+Dialects: `postgres`, `mysql`, `sqlite` (placeholder style + upsert syntax). Expired rows are treated as absent on read and deleted lazily. Expiry is computed and compared from database server time inside every statement — `expires_at` is written as `<server now> + <ttl ms>` (a NULL ttl parameter yields a NULL expiry in all three dialects) and reads, deletes, compare-and-delete, the set-if-absent cleanup and the sweeper all filter against the same expression — so no client clock takes part and skewed nodes cannot disagree about a row's, or a lock lease's, lifetime. A background sweeper (`time.NewTicker`, default every 5 m, configurable) deletes expired rows in bounded batches (default 1 000 rows per statement, looping while full batches are deleted), each pass under its own timeout on a context derived from the driver's lifecycle and canceled by `Close`, which joins the goroutine before returning.
 
 Schema setup: `Migrate(ctx)` is a dev/test convenience; `(*Driver).Schema() []string` exports the DDL statements so production users apply it through their own migration tooling (golang-migrate, Flyway, CI/CD) under least-privilege credentials. Nothing runs implicitly.
 
@@ -313,7 +313,7 @@ err = lock.Release(ctx)
 err = lock.ForceRelease(ctx)
 ```
 
-- Each `Lock` value holds a crypto/rand owner token. `Release` deletes via `DeleteIfEquals(key, token)` — a lock re-acquired by someone else after TTL expiry cannot be released by the old holder.
+- Every successful `Acquire` mints a fresh crypto/rand owner token and stores it on the `*Lock` under a mutex. `Release` consumes it — takes the token, clears the slot, then deletes via `DeleteIfEquals(key, token)` — so a lock re-acquired by someone else after TTL expiry cannot be released by the old holder, and a token retired with its lease can never match a later one. `Release` with nothing held is a nil no-op; `ForceRelease` deletes unconditionally and retires the local token too. A `*Lock` holds one lease at a time: reusing a value sequentially is safe, sharing one between independent holders is not.
 - `Acquire` → driver `Add` with the lock TTL. `Block` retries with jittered backoff (default 50–250 ms, `time.NewTimer`+`Reset`, select on `ctx.Done()`) until acquired, ctx canceled, or timeout → `ErrLockTimeout`. `Do` = acquire (`ErrLockHeld` if taken), run, release via `defer` (runs on panic too).
 - Lock keys: `<prefix>:1:l:<namespaced name>` (§7), stored on L2 when present (distributed), else the sole driver. Locks bypass L1, envelopes, tags, and the bus.
 - TTL is the deadlock ceiling: a crashed holder's lock frees itself at expiry. A zero or negative TTL is rejected with `ErrLockTTL` rather than taking a lock that would never expire.

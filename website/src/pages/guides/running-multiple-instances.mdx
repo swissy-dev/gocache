@@ -108,6 +108,11 @@ most expensive rebuilds are the fix.
 sessions or queues, and makes cache traffic separable in monitoring. See the warning in
 [Keys and namespaces](/concepts/keys-and-namespaces).
 
-**Clock skew.** Expiry is compared against each instance's own clock. Meaningful skew across your
-fleet means entries expire at different times on different instances — usually harmless, but worth
-knowing when a stale read is otherwise inexplicable.
+**Clock skew.** *Logical* expiry — the timestamps carried inside a cached value — is compared against
+each instance's own clock, so meaningful skew across your fleet means entries look stale at different
+times on different instances. Usually harmless, but worth knowing when a stale read is otherwise
+inexplicable.
+
+The stores are not affected: Redis and the [SQL driver](/drivers/sql) both expire against their
+server's clock, so a row's lifetime is the same fact for everyone. That is what keeps a
+[lock](/features/locks) lease safe when the instance holding it is the one with the wrong clock.

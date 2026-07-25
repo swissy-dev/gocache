@@ -278,9 +278,9 @@ err = lock.Release(ctx)
 err = lock.ForceRelease(ctx)            // break someone else's lock
 ```
 
-Each lock carries a random owner token, so if your TTL lapses and another process takes over, your
-`Release` can't delete their lock. The TTL is the deadlock ceiling: crash while holding it and it
-frees itself.
+Every acquire mints a fresh random owner token, so if your TTL lapses and another process takes over,
+your `Release` can't delete their lock — and once a lease ends its token is retired, so a second
+`Release` can't either. The TTL is the deadlock ceiling: crash while holding it and it frees itself.
 
 ## Surviving a bad day
 

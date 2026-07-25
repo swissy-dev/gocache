@@ -1,8 +1,11 @@
 package gocache
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"slices"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -33,6 +36,158 @@ func (d *ctxCheckingDriver) Delete(ctx context.Context, key string) (bool, error
 		return false, err
 	}
 	return d.Driver.Delete(ctx, key)
+}
+
+type tokenRecordingDriver struct {
+	*memory.Driver
+	mu       sync.Mutex
+	acquired [][]byte
+	compared [][]byte
+}
+
+func (d *tokenRecordingDriver) Add(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	ok, err := d.Driver.Add(ctx, key, value, ttl)
+	if ok {
+		d.mu.Lock()
+		d.acquired = append(d.acquired, bytes.Clone(value))
+		d.mu.Unlock()
+	}
+	return ok, err
+}
+
+func (d *tokenRecordingDriver) DeleteIfEquals(ctx context.Context, key string, value []byte) (bool, error) {
+	d.mu.Lock()
+	d.compared = append(d.compared, bytes.Clone(value))
+	d.mu.Unlock()
+	return d.Driver.DeleteIfEquals(ctx, key, value)
+}
+
+func (d *tokenRecordingDriver) tokens() [][]byte {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.acquired)
+}
+
+func (d *tokenRecordingDriver) comparisons() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.compared)
+}
+
+func newRecordingCache(t *testing.T) (*Cache, *tokenRecordingDriver) {
+	t.Helper()
+	d := &tokenRecordingDriver{Driver: memory.New()}
+	c, err := New(WithL1(d))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c, d
+}
+
+func TestAcquireMintsAFreshTokenForEachLease(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c, d := newRecordingCache(t)
+		ctx := context.Background()
+		l := c.Lock("job", time.Second)
+		if ok, err := l.Acquire(ctx); err != nil || !ok {
+			t.Fatalf("first acquire ok=%v err=%v", ok, err)
+		}
+		time.Sleep(2 * time.Second)
+		if ok, err := l.Acquire(ctx); err != nil || !ok {
+			t.Fatalf("second acquire ok=%v err=%v", ok, err)
+		}
+		tokens := d.tokens()
+		if len(tokens) != 2 {
+			t.Fatalf("recorded %d leases", len(tokens))
+		}
+		if bytes.Equal(tokens[0], tokens[1]) {
+			t.Fatal("the second lease reuses the lapsed lease's owner token")
+		}
+		ok, err := d.DeleteIfEquals(ctx, c.lockKey("job"), tokens[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			t.Fatal("a token retired with the first lease deleted the second lease")
+		}
+		if ok, err := c.Lock("job", time.Second).Acquire(ctx); err != nil || ok {
+			t.Fatalf("the second lease is no longer held: ok=%v err=%v", ok, err)
+		}
+	})
+}
+
+func TestReleaseWithNothingHeldIsANoOp(t *testing.T) {
+	c, d := newRecordingCache(t)
+	ctx := context.Background()
+	l := c.Lock("job", time.Minute)
+	if ok, err := l.Acquire(ctx); err != nil || !ok {
+		t.Fatalf("acquire ok=%v err=%v", ok, err)
+	}
+	if err := l.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := d.comparisons()
+	if err := l.Release(ctx); err != nil {
+		t.Fatalf("releasing nothing must return nil: %v", err)
+	}
+	if d.comparisons() != before {
+		t.Fatal("a release with nothing held replayed a retired owner token")
+	}
+	other := c.Lock("job", time.Minute)
+	if ok, err := other.Acquire(ctx); err != nil || !ok {
+		t.Fatalf("other acquire ok=%v err=%v", ok, err)
+	}
+	if err := l.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if d.comparisons() != before {
+		t.Fatal("a release with nothing held attacked another owner's lease")
+	}
+	if ok, err := c.Lock("job", time.Minute).Acquire(ctx); err != nil || ok {
+		t.Fatalf("another owner's lease was released: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestForceReleaseRetiresTheLocalToken(t *testing.T) {
+	c, d := newRecordingCache(t)
+	ctx := context.Background()
+	l := c.Lock("job", time.Minute)
+	if ok, err := l.Acquire(ctx); err != nil || !ok {
+		t.Fatalf("acquire ok=%v err=%v", ok, err)
+	}
+	if err := l.ForceRelease(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := d.comparisons()
+	if err := l.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if d.comparisons() != before {
+		t.Fatal("release replayed a token that force release should have retired")
+	}
+}
+
+func TestDoRetiresTheTokenItReleased(t *testing.T) {
+	c, d := newRecordingCache(t)
+	ctx := context.Background()
+	l := c.Lock("job", time.Minute)
+	if err := l.Do(ctx, func(context.Context) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := c.Lock("job", time.Minute).Acquire(ctx); err != nil || !ok {
+		t.Fatalf("do did not release: ok=%v err=%v", ok, err)
+	}
+	before := d.comparisons()
+	if err := l.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if d.comparisons() != before {
+		t.Fatal("release replayed the token do already retired")
+	}
+	if ok, err := c.Lock("job", time.Minute).Acquire(ctx); err != nil || ok {
+		t.Fatalf("the lease taken after do returned was released: ok=%v err=%v", ok, err)
+	}
 }
 
 func TestLockExclusion(t *testing.T) {

@@ -93,8 +93,8 @@ describe both tiers.
 L1) and joins the per-*tag* errors from that write. The best-effort copy it keeps in L1's tag cache
 is not part of the returned error — if that write fails, it is logged, not returned.
 
-**Lock methods** — return driver errors wrapped. `Release` returns nil when the owner token no
-longer matches, since that is a legitimate outcome rather than a failure.
+**Lock methods** — return driver errors wrapped. `Release` returns nil when nothing is held or when
+the owner token no longer matches, since both are legitimate outcomes rather than failures.
 
 ## After Close
 
