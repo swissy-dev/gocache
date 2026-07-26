@@ -129,9 +129,11 @@ linters:
       # Test fixture strings ("ana", "stale") and long table-driven tests are fine.
       - linters: [goconst, funlen, gocyclo, dupl, gosec]
         path: _test\.go
-      # drivertest.Run is the driver conformance suite: one long sequence of
-      # independent t.Run behaviour checks. Known debt, tracked for a split.
-      - linters: [gocyclo, funlen]
+      # The conformance behaviours are test bodies, not assertion helpers.
+      # Adding t.Helper() to them reports failures at Run's dispatch line
+      # rather than the assertion that actually failed, which is worse for
+      # driver authors. Run and advance are helpers and do call it.
+      - linters: [thelper]
         path: driver/drivertest/drivertest\.go
 
   settings:
