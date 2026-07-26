@@ -20,7 +20,7 @@ type runtime struct {
 	wg        sync.WaitGroup
 	trackMu   sync.RWMutex
 	closeOnce sync.Once
-	closed    atomic.Bool
+	isClosed  atomic.Bool
 	closeErr  error
 	sf        singleflight.Group
 	flights   *semaphore.Weighted
@@ -32,7 +32,7 @@ type runtime struct {
 func (rt *runtime) track() bool {
 	rt.trackMu.RLock()
 	defer rt.trackMu.RUnlock()
-	if rt.closed.Load() {
+	if rt.isClosed.Load() {
 		return false
 	}
 	rt.wg.Add(1)
@@ -48,7 +48,7 @@ func newOrigin() string {
 func (c *Cache) Close() error {
 	c.rt.closeOnce.Do(func() {
 		c.rt.trackMu.Lock()
-		c.rt.closed.Store(true)
+		c.rt.isClosed.Store(true)
 		c.rt.trackMu.Unlock()
 		c.rt.cancel()
 		c.rt.wg.Wait()
@@ -73,7 +73,7 @@ func (c *Cache) handleBusMsg(ctx context.Context, msg []byte) {
 			c.logf("bus handler panic", "panic", p)
 		}
 	}()
-	if c.rt.closed.Load() {
+	if c.rt.isClosed.Load() {
 		return
 	}
 	var m busMsg

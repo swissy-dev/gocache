@@ -81,7 +81,7 @@ func (d *Driver) DeleteMany(ctx context.Context, keys []string) error {
 }
 
 func (d *Driver) deleteMany(ctx context.Context, keys []string) error {
-	sharded := d.sharded()
+	sharded := d.isSharded()
 	for chunk := range slices.Chunk(keys, deleteBatch) {
 		if sharded {
 			if _, err := d.client.Pipelined(ctx, func(p redis.Pipeliner) error {
@@ -101,7 +101,7 @@ func (d *Driver) deleteMany(ctx context.Context, keys []string) error {
 	return nil
 }
 
-func (d *Driver) sharded() bool {
+func (d *Driver) isSharded() bool {
 	switch d.client.(type) {
 	case clusterClient, ringClient:
 		return true
