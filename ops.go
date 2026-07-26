@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"time"
 )
@@ -89,12 +90,27 @@ func (c *Cache) backfillL1(ctx context.Context, fullKey string, env envelope, no
 	}
 }
 
+const (
+	maxDuration = time.Duration(math.MaxInt64)
+	minDuration = time.Duration(math.MinInt64)
+)
+
+func addDurationsSaturating(a, b time.Duration) time.Duration {
+	sum := a + b
+	if a > 0 && b > 0 && sum < 0 {
+		return maxDuration
+	}
+	if a < 0 && b < 0 && sum > 0 {
+		return minDuration
+	}
+	return sum
+}
+
 func physicalTTL(env envelope, now time.Time, grace time.Duration) time.Duration {
 	if env.ExpiresAt == 0 {
 		return 0
 	}
-	remaining := time.UnixMilli(env.ExpiresAt).Sub(now)
-	return remaining + grace
+	return addDurationsSaturating(time.UnixMilli(env.ExpiresAt).Sub(now), grace)
 }
 
 func (c *Cache) writeEnvelope(ctx context.Context, fullKey string, env envelope, o callOpts) error {

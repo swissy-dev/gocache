@@ -3,6 +3,7 @@ package gocache
 import (
 	"context"
 	"errors"
+	"math"
 	"slices"
 	"sync"
 	"testing"
@@ -479,5 +480,32 @@ func TestSkipL1RemovesAnyExistingL1Copy(t *testing.T) {
 	}
 	if got.Name != "v2" {
 		t.Fatalf("served a stale value after WithSkipL1: %+v", got)
+	}
+}
+
+func TestVeryLongTTLIsNotTruncatedToAMillisecond(t *testing.T) {
+	now := time.Now()
+
+	for _, tc := range []struct {
+		name  string
+		ttl   time.Duration
+		grace time.Duration
+	}{
+		{"max ttl without grace", time.Duration(math.MaxInt64), 0},
+		{"max ttl with grace", time.Duration(math.MaxInt64), time.Minute},
+		{"max ttl with large grace", time.Duration(math.MaxInt64), time.Duration(math.MaxInt64)},
+		{"century ttl with grace", 100 * 365 * 24 * time.Hour, time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newEnvelope([]byte(`1`), now, tc.ttl, nil)
+			if !env.isFresh(now) {
+				t.Fatalf("envelope with ttl %v is not fresh at write time", tc.ttl)
+			}
+
+			got := physicalTTL(env, now, tc.grace)
+			if got <= 0 {
+				t.Fatalf("physical ttl for a fresh envelope is %v; writeEnvelope would clamp it to 1ms", got)
+			}
+		})
 	}
 }
