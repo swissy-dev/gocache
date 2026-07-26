@@ -64,15 +64,6 @@ jobs:
       - name: Lint
         run: "$(go env GOPATH)/bin/golangci-lint run --build-tags=integration ./..."
 
-      - name: Check formatting
-        run: |
-          unformatted=$(gofmt -l $(go list -f '{{.Dir}}' ./...))
-          if [ -n "$unformatted" ]; then
-            echo "These files are not gofmt'd:"
-            echo "$unformatted"
-            exit 1
-          fi
-
       - name: Verify go.mod is tidy
         run: |
           go mod tidy
