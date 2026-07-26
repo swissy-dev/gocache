@@ -53,7 +53,6 @@ gocache/                        core package
 ├── lifecycle.go                lifecycle context, WaitGroup, Close, bus handling
 ├── lock.go                     atomic locks
 ├── events.go                   event types + hook
-├── example/                    runnable usage examples
 ├── driver/
 │   ├── drivertest/             shared conformance suite (imports gocache)
 │   ├── memory/                 LRU + TTL (also the L1 tier)

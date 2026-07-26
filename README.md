@@ -65,8 +65,6 @@ func main() {
 }
 ```
 
-A runnable version lives in [`example/`](example/) — `go run ./example`.
-
 ## How it works
 
 Every entry is stored with a *logical* expiry (its TTL) and, if grace is configured, kept
