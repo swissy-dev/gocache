@@ -27,6 +27,7 @@ func TestRedisConformance(t *testing.T) {
 	}
 	drivertest.Run(t, drivertest.Config{
 		New: func(t *testing.T) gocache.Driver {
+			t.Helper()
 			if err := client.FlushDB(context.Background()).Err(); err != nil {
 				t.Fatal(err)
 			}
@@ -95,6 +96,7 @@ func TestRedisClusterConformance(t *testing.T) {
 	client := newClusterClient(t)
 	drivertest.Run(t, drivertest.Config{
 		New: func(t *testing.T) gocache.Driver {
+			t.Helper()
 			flushCluster(t, client)
 			return New(client)
 		},

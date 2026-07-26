@@ -50,9 +50,7 @@ func BenchmarkSaturatedConcurrentGetSet(b *testing.B) {
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
 	for range 4 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := 0; ; i++ {
 				select {
 				case <-stop:
@@ -61,7 +59,7 @@ func BenchmarkSaturatedConcurrentGetSet(b *testing.B) {
 				}
 				_, _, _ = d.Get(ctx, "seed:"+strconv.Itoa(i%maxEntries))
 			}
-		}()
+		})
 	}
 
 	for i := 0; b.Loop(); i++ {

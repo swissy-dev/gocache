@@ -50,9 +50,7 @@ func TestStampedeProtection(t *testing.T) {
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	for range 50 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			v, err := GetOrSet(ctx, c, "k", func(context.Context) (user, error) {
 				calls.Add(1)
@@ -62,7 +60,7 @@ func TestStampedeProtection(t *testing.T) {
 			if err != nil || v.Name != "ana" {
 				t.Errorf("v=%+v err=%v", v, err)
 			}
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()
@@ -115,9 +113,7 @@ func TestFactoryConcurrencyIsBounded(t *testing.T) {
 		defer releaseAll()
 		var wg sync.WaitGroup
 		for i := range keys {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				_, err := GetOrSet(context.Background(), c, "k"+strconv.Itoa(i), func(context.Context) (user, error) {
 					mu.Lock()
 					live++
@@ -132,7 +128,7 @@ func TestFactoryConcurrencyIsBounded(t *testing.T) {
 				if err != nil {
 					t.Errorf("GetOrSet: %v", err)
 				}
-			}()
+			})
 		}
 		synctest.Wait()
 
@@ -167,9 +163,7 @@ func TestSameKeyCallersShareOneFactorySlot(t *testing.T) {
 		defer releaseAll()
 		var wg sync.WaitGroup
 		for range 20 {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				if _, err := GetOrSet(context.Background(), c, "same", func(context.Context) (user, error) {
 					shared.Add(1)
 					<-release
@@ -177,13 +171,11 @@ func TestSameKeyCallersShareOneFactorySlot(t *testing.T) {
 				}); err != nil {
 					t.Errorf("shared GetOrSet: %v", err)
 				}
-			}()
+			})
 		}
 		synctest.Wait()
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if _, err := GetOrSet(context.Background(), c, "other", func(context.Context) (user, error) {
 				other.Add(1)
 				<-release
@@ -191,7 +183,7 @@ func TestSameKeyCallersShareOneFactorySlot(t *testing.T) {
 			}); err != nil {
 				t.Errorf("other GetOrSet: %v", err)
 			}
-		}()
+		})
 		synctest.Wait()
 
 		if got := shared.Load(); got != 1 {

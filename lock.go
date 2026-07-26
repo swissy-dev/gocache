@@ -3,7 +3,6 @@ package gocache
 import (
 	"context"
 	crand "crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"math/rand/v2"
 	"sync"
@@ -27,9 +26,7 @@ func (c *Cache) Lock(name string, ttl time.Duration) *Lock {
 }
 
 func newLockToken() []byte {
-	b := make([]byte, 16)
-	crand.Read(b)
-	return []byte(hex.EncodeToString(b))
+	return []byte(crand.Text())
 }
 
 func (l *Lock) hold(token []byte) {

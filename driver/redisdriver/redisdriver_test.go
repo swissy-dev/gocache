@@ -17,6 +17,7 @@ func TestConformance(t *testing.T) {
 	var server *miniredis.Miniredis
 	drivertest.Run(t, drivertest.Config{
 		New: func(t *testing.T) gocache.Driver {
+			t.Helper()
 			server = miniredis.RunT(t)
 			client := redis.NewClient(&redis.Options{Addr: server.Addr()})
 			t.Cleanup(func() {
@@ -26,7 +27,10 @@ func TestConformance(t *testing.T) {
 			})
 			return New(client)
 		},
-		Advance: func(t *testing.T, d time.Duration) { server.FastForward(d) },
+		Advance: func(t *testing.T, d time.Duration) {
+			t.Helper()
+			server.FastForward(d)
+		},
 	})
 }
 
@@ -78,11 +82,13 @@ func TestRingConformance(t *testing.T) {
 	var servers []*miniredis.Miniredis
 	drivertest.Run(t, drivertest.Config{
 		New: func(t *testing.T) gocache.Driver {
+			t.Helper()
 			var client *redis.Ring
 			client, servers = newRing(t, 3)
 			return New(client)
 		},
 		Advance: func(t *testing.T, d time.Duration) {
+			t.Helper()
 			for _, server := range servers {
 				server.FastForward(d)
 			}

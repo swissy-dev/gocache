@@ -11,7 +11,10 @@ import (
 
 func TestConformance(t *testing.T) {
 	drivertest.Run(t, drivertest.Config{
-		New: func(t *testing.T) gocache.Driver { return New() },
+		New: func(t *testing.T) gocache.Driver {
+			t.Helper()
+			return New()
+		},
 	})
 }
 

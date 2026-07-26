@@ -39,7 +39,10 @@ func newTestDriver(t *testing.T, opts ...Option) *Driver {
 
 func TestConformance(t *testing.T) {
 	drivertest.Run(t, drivertest.Config{
-		New: func(t *testing.T) gocache.Driver { return newTestDriver(t) },
+		New: func(t *testing.T) gocache.Driver {
+			t.Helper()
+			return newTestDriver(t)
+		},
 	})
 }
 
