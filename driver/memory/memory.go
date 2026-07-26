@@ -30,7 +30,7 @@ type entry struct {
 	expiresAt time.Time
 }
 
-func (e *entry) expired(now time.Time) bool {
+func (e *entry) isExpired(now time.Time) bool {
 	return !e.expiresAt.IsZero() && now.After(e.expiresAt)
 }
 
@@ -57,7 +57,7 @@ func (d *Driver) Get(ctx context.Context, key string) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 	en := el.Value.(*entry)
-	if en.expired(time.Now()) {
+	if en.isExpired(time.Now()) {
 		d.remove(el)
 		return nil, false, nil
 	}
@@ -105,7 +105,7 @@ func (d *Driver) reclaimExpiredFromColdEnd(now time.Time, window int) {
 	el := d.lru.Back()
 	for i := 0; i < window && el != nil; i++ {
 		prev := el.Prev()
-		if el.Value.(*entry).expired(now) {
+		if el.Value.(*entry).isExpired(now) {
 			d.remove(el)
 		}
 		el = prev
@@ -117,7 +117,7 @@ func (d *Driver) Add(ctx context.Context, key string, value []byte, ttl time.Dur
 	defer d.mu.Unlock()
 	if el, ok := d.items[key]; ok {
 		en := el.Value.(*entry)
-		if !en.expired(time.Now()) {
+		if !en.isExpired(time.Now()) {
 			return false, nil
 		}
 		d.remove(el)
@@ -133,7 +133,7 @@ func (d *Driver) Delete(ctx context.Context, key string) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	expired := el.Value.(*entry).expired(time.Now())
+	expired := el.Value.(*entry).isExpired(time.Now())
 	d.remove(el)
 	return !expired, nil
 }
@@ -157,7 +157,7 @@ func (d *Driver) DeleteIfEquals(ctx context.Context, key string, value []byte) (
 		return false, nil
 	}
 	en := el.Value.(*entry)
-	if en.expired(time.Now()) || !bytes.Equal(en.value, value) {
+	if en.isExpired(time.Now()) || !bytes.Equal(en.value, value) {
 		return false, nil
 	}
 	d.remove(el)

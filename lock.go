@@ -44,7 +44,7 @@ func (l *Lock) retire() []byte {
 }
 
 func (l *Lock) Acquire(ctx context.Context) (bool, error) {
-	if l.cache.rt.closed.Load() {
+	if l.cache.rt.isClosed.Load() {
 		return false, ErrClosed
 	}
 	if l.ttl <= 0 {
@@ -63,7 +63,7 @@ func (l *Lock) Acquire(ctx context.Context) (bool, error) {
 }
 
 func (l *Lock) Release(ctx context.Context) error {
-	if l.cache.rt.closed.Load() {
+	if l.cache.rt.isClosed.Load() {
 		return ErrClosed
 	}
 	token := l.retire()
@@ -83,7 +83,7 @@ func (l *Lock) Release(ctx context.Context) error {
 }
 
 func (l *Lock) ForceRelease(ctx context.Context) error {
-	if l.cache.rt.closed.Load() {
+	if l.cache.rt.isClosed.Load() {
 		return ErrClosed
 	}
 	l.retire()

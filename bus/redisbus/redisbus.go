@@ -20,13 +20,13 @@ func WithChannel(name string) Option {
 }
 
 type Bus struct {
-	client  redis.UniversalClient
-	channel string
-	mu      sync.Mutex
-	subs    []*redis.PubSub
-	wg      sync.WaitGroup
-	once    sync.Once
-	closed  bool
+	client   redis.UniversalClient
+	channel  string
+	mu       sync.Mutex
+	subs     []*redis.PubSub
+	wg       sync.WaitGroup
+	once     sync.Once
+	isClosed bool
 }
 
 func New(client redis.UniversalClient, opts ...Option) *Bus {
@@ -51,7 +51,7 @@ func (b *Bus) Subscribe(ctx context.Context, handler func(ctx context.Context, m
 		return fmt.Errorf("redisbus: subscribe: %w", err)
 	}
 	b.mu.Lock()
-	if b.closed {
+	if b.isClosed {
 		b.mu.Unlock()
 		_ = pubsub.Close()
 		return ErrClosed
@@ -81,7 +81,7 @@ func (b *Bus) Subscribe(ctx context.Context, handler func(ctx context.Context, m
 func (b *Bus) Close() error {
 	b.once.Do(func() {
 		b.mu.Lock()
-		b.closed = true
+		b.isClosed = true
 		subs := b.subs
 		b.subs = nil
 		b.mu.Unlock()

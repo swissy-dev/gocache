@@ -70,7 +70,7 @@ func (c *Cache) tagsValid(ctx context.Context, env envelope) (bool, error) {
 }
 
 func (c *Cache) DeleteByTag(ctx context.Context, tags ...string) error {
-	if c.rt.closed.Load() {
+	if c.rt.isClosed.Load() {
 		return ErrClosed
 	}
 	now := c.cfg.clock().UnixMilli()

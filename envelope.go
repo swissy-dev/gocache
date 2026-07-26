@@ -20,7 +20,7 @@ func newEnvelope(value []byte, now time.Time, ttl time.Duration, tags []string) 
 	return e
 }
 
-func (e envelope) fresh(now time.Time) bool {
+func (e envelope) isFresh(now time.Time) bool {
 	return e.ExpiresAt == 0 || now.UnixMilli() < e.ExpiresAt
 }
 

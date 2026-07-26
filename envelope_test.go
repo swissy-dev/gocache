@@ -33,10 +33,10 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 func TestEnvelopeFreshness(t *testing.T) {
 	now := time.UnixMilli(1_700_000_000_000)
 	e := newEnvelope([]byte(`1`), now, time.Minute, nil)
-	if !e.fresh(now.Add(59 * time.Second)) {
+	if !e.isFresh(now.Add(59 * time.Second)) {
 		t.Fatal("expected fresh before expiry")
 	}
-	if e.fresh(now.Add(61 * time.Second)) {
+	if e.isFresh(now.Add(61 * time.Second)) {
 		t.Fatal("expected stale after expiry")
 	}
 }
@@ -47,7 +47,7 @@ func TestEnvelopeForever(t *testing.T) {
 	if e.ExpiresAt != 0 {
 		t.Fatalf("expiresAt = %d", e.ExpiresAt)
 	}
-	if !e.fresh(now.Add(1000 * time.Hour)) {
+	if !e.isFresh(now.Add(1000 * time.Hour)) {
 		t.Fatal("forever entry must always be fresh")
 	}
 }

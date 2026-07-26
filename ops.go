@@ -10,10 +10,10 @@ import (
 )
 
 type readResult struct {
-	env   envelope
-	found bool
-	fresh bool
-	tier  Tier
+	env     envelope
+	isFound bool
+	isFresh bool
+	tier    Tier
 }
 
 func (c *Cache) readTier(ctx context.Context, d Driver, fullKey string) (envelope, bool, error) {
@@ -43,14 +43,14 @@ func (c *Cache) read(ctx context.Context, fullKey string) (readResult, error) {
 		if err != nil {
 			return readResult{}, err
 		}
-		if ok && env.fresh(now) {
-			return readResult{env: env, found: true, fresh: true, tier: TierL1}, nil
+		if ok && env.isFresh(now) {
+			return readResult{env: env, isFound: true, isFresh: true, tier: TierL1}, nil
 		}
 		if c.cfg.l2 == nil {
-			return readResult{env: env, found: ok, tier: TierL1}, nil
+			return readResult{env: env, isFound: ok, tier: TierL1}, nil
 		}
 		if ok {
-			staleL1 = readResult{env: env, found: true, tier: TierL1}
+			staleL1 = readResult{env: env, isFound: true, tier: TierL1}
 		}
 	}
 	if c.cfg.l2 != nil {
@@ -62,11 +62,11 @@ func (c *Cache) read(ctx context.Context, fullKey string) (readResult, error) {
 		if !ok {
 			return staleL1, nil
 		}
-		if env.fresh(now) {
+		if env.isFresh(now) {
 			c.backfillL1(ctx, fullKey, env, now, gen)
-			return readResult{env: env, found: true, fresh: true, tier: TierL2}, nil
+			return readResult{env: env, isFound: true, isFresh: true, tier: TierL2}, nil
 		}
-		return readResult{env: env, found: true, tier: TierL2}, nil
+		return readResult{env: env, isFound: true, tier: TierL2}, nil
 	}
 	return readResult{}, nil
 }
@@ -98,7 +98,7 @@ func physicalTTL(env envelope, now time.Time, grace time.Duration) time.Duration
 }
 
 func (c *Cache) writeEnvelope(ctx context.Context, fullKey string, env envelope, o callOpts) error {
-	if c.rt.closed.Load() {
+	if c.rt.isClosed.Load() {
 		return ErrClosed
 	}
 	raw, err := env.encode()
@@ -183,7 +183,7 @@ func decodeValue[T any](c *Cache, env envelope) (T, error) {
 
 func Get[T any](ctx context.Context, c *Cache, key string) (T, bool, error) {
 	var zero T
-	if c.rt.closed.Load() {
+	if c.rt.isClosed.Load() {
 		return zero, false, ErrClosed
 	}
 	k := c.key(key)
@@ -191,7 +191,7 @@ func Get[T any](ctx context.Context, c *Cache, key string) (T, bool, error) {
 	if err != nil {
 		return zero, false, err
 	}
-	if !res.found || !res.fresh {
+	if !res.isFound || !res.isFresh {
 		c.emit(EventMiss{Key: k})
 		return zero, false, nil
 	}
@@ -204,7 +204,7 @@ func Get[T any](ctx context.Context, c *Cache, key string) (T, bool, error) {
 }
 
 func Set(ctx context.Context, c *Cache, key string, value any, opts ...CallOption) error {
-	if c.rt.closed.Load() {
+	if c.rt.isClosed.Load() {
 		return ErrClosed
 	}
 	o := c.callOpts(opts)
@@ -225,7 +225,7 @@ func SetForever(ctx context.Context, c *Cache, key string, value any, opts ...Ca
 }
 
 func (c *Cache) withinGrace(res readResult, o callOpts) bool {
-	return res.found && o.grace > 0 && res.env.ExpiresAt != 0 &&
+	return res.isFound && o.grace > 0 && res.env.ExpiresAt != 0 &&
 		c.cfg.clock().Before(time.UnixMilli(res.env.ExpiresAt).Add(o.grace))
 }
 
@@ -238,7 +238,7 @@ func factoryError(err error) error {
 
 func GetOrSet[T any](ctx context.Context, c *Cache, key string, factory func(context.Context) (T, error), opts ...CallOption) (T, error) {
 	var zero T
-	if c.rt.closed.Load() {
+	if c.rt.isClosed.Load() {
 		return zero, ErrClosed
 	}
 	o := c.callOpts(opts)
@@ -247,7 +247,7 @@ func GetOrSet[T any](ctx context.Context, c *Cache, key string, factory func(con
 	if err != nil {
 		return zero, err
 	}
-	if res.found && res.fresh {
+	if res.isFound && res.isFresh {
 		c.emit(EventHit{Key: k, Tier: res.tier})
 		return decodeValue[T](c, res.env)
 	}
@@ -316,7 +316,7 @@ func (c *Cache) runFlight(callerCtx context.Context, fullKey string, factory fun
 		defer tcancel()
 	}
 	if aerr := c.rt.flights.Acquire(fctx, 1); aerr != nil {
-		if c.rt.closed.Load() {
+		if c.rt.isClosed.Load() {
 			return nil, ErrClosed
 		}
 		serr := fmt.Errorf("%w: %w", ErrFactoryLimit, aerr)

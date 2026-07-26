@@ -89,18 +89,18 @@ func (c *Cache) logf(msg string, args ...any) {
 }
 
 func (c *Cache) Has(ctx context.Context, key string) (bool, error) {
-	if c.rt.closed.Load() {
+	if c.rt.isClosed.Load() {
 		return false, ErrClosed
 	}
 	res, err := c.read(ctx, c.key(key))
 	if err != nil {
 		return false, err
 	}
-	return res.found && res.fresh, nil
+	return res.isFound && res.isFresh, nil
 }
 
 func (c *Cache) Delete(ctx context.Context, key string) (bool, error) {
-	if c.rt.closed.Load() {
+	if c.rt.isClosed.Load() {
 		return false, ErrClosed
 	}
 	k := c.key(key)
@@ -133,7 +133,7 @@ func (c *Cache) Delete(ctx context.Context, key string) (bool, error) {
 }
 
 func (c *Cache) DeleteMany(ctx context.Context, keys []string) error {
-	if c.rt.closed.Load() {
+	if c.rt.isClosed.Load() {
 		return ErrClosed
 	}
 	full := make([]string, len(keys))
@@ -163,7 +163,7 @@ func (c *Cache) DeleteMany(ctx context.Context, keys []string) error {
 }
 
 func (c *Cache) Clear(ctx context.Context) error {
-	if c.rt.closed.Load() {
+	if c.rt.isClosed.Load() {
 		return ErrClosed
 	}
 	prefix := c.scopedPrefix(domainData)
