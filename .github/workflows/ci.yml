@@ -18,29 +18,23 @@ env:
 
 jobs:
   test:
-    name: Test
+    name: Test (Go ${{ matrix.go }})
     runs-on: ubuntu-latest
+    # Without this, a go.mod bump past the oldest matrix entry would silently
+    # download a newer toolchain and the leg would pass without testing it.
+    env:
+      GOTOOLCHAIN: local
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.25.x', '1.26.x']
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go }}
           cache: true
-
-      - name: Check formatting
-        run: |
-          unformatted=$(gofmt -l $(go list -f '{{.Dir}}' ./...))
-          if [ -n "$unformatted" ]; then
-            echo "These files are not gofmt'd:"
-            echo "$unformatted"
-            exit 1
-          fi
-
-      - name: Verify go.mod is tidy
-        run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
 
       - name: Vet
         run: go vet -tags integration ./...
@@ -69,6 +63,20 @@ jobs:
 
       - name: Lint
         run: "$(go env GOPATH)/bin/golangci-lint run --build-tags=integration ./..."
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l $(go list -f '{{.Dir}}' ./...))
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
 
   integration:
     name: Integration
