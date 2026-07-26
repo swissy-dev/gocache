@@ -116,27 +116,35 @@ func (c *Cache) writeEnvelope(ctx context.Context, fullKey string, env envelope,
 		}
 		c.emit(EventWritten{Key: fullKey, Tier: TierL2})
 	}
-	var l1err error
-	authOK := true
-	if c.cfg.l1 != nil {
-		if o.skipL1 {
-			if _, err := c.cfg.l1.Delete(ctx, fullKey); err != nil {
-				c.logf("l1 skip delete failed", "key", fullKey, "err", err)
-			}
-		} else if err := c.cfg.l1.Set(ctx, fullKey, raw, ttl); err != nil {
-			l1err = fmt.Errorf("gocache: l1 set: %w", err)
-			if c.cfg.l2 == nil {
-				authOK = false
-			}
-		} else {
-			c.emit(EventWritten{Key: fullKey, Tier: TierL1})
-		}
-	}
+	authOK, l1err := c.writeL1(ctx, fullKey, raw, ttl, o)
 	if authOK && !o.skipBus {
-		c.publish("delete", []string{fullKey}, "", "")
+		c.publish(opDelete, []string{fullKey}, "", "")
 	}
 	return l1err
 }
+
+func (c *Cache) writeL1(ctx context.Context, fullKey string, raw []byte, ttl time.Duration, o callOpts) (bool, error) {
+	if c.cfg.l1 == nil {
+		return true, nil
+	}
+	if o.skipL1 {
+		if _, err := c.cfg.l1.Delete(ctx, fullKey); err != nil {
+			c.logf("l1 skip delete failed", "key", fullKey, "err", err)
+		}
+		return true, nil
+	}
+	if err := c.cfg.l1.Set(ctx, fullKey, raw, ttl); err != nil {
+		return c.cfg.l2 != nil, fmt.Errorf("gocache: l1 set: %w", err)
+	}
+	c.emit(EventWritten{Key: fullKey, Tier: TierL1})
+	return true, nil
+}
+
+const (
+	opDelete = "delete"
+	opClear  = "clear"
+	opTag    = "tag"
+)
 
 type busMsg struct {
 	Origin string   `json:"o"`
@@ -216,6 +224,18 @@ func SetForever(ctx context.Context, c *Cache, key string, value any, opts ...Ca
 	return Set(ctx, c, key, value, withForever(opts)...)
 }
 
+func (c *Cache) withinGrace(res readResult, o callOpts) bool {
+	return res.found && o.grace > 0 && res.env.ExpiresAt != 0 &&
+		c.cfg.clock().Before(time.UnixMilli(res.env.ExpiresAt).Add(o.grace))
+}
+
+func factoryError(err error) error {
+	if errors.Is(err, ErrFactoryLimit) || errors.Is(err, ErrClosed) {
+		return err
+	}
+	return fmt.Errorf("gocache: factory: %w", err)
+}
+
 func GetOrSet[T any](ctx context.Context, c *Cache, key string, factory func(context.Context) (T, error), opts ...CallOption) (T, error) {
 	var zero T
 	if c.rt.closed.Load() {
@@ -232,8 +252,7 @@ func GetOrSet[T any](ctx context.Context, c *Cache, key string, factory func(con
 		return decodeValue[T](c, res.env)
 	}
 	c.emit(EventMiss{Key: k})
-	graced := res.found && o.grace > 0 && res.env.ExpiresAt != 0 &&
-		c.cfg.clock().Before(time.UnixMilli(res.env.ExpiresAt).Add(o.grace))
+	graced := c.withinGrace(res, o)
 	ch := c.rt.sf.DoChan(k, func() (any, error) {
 		return c.runFlight(ctx, k, func(fctx context.Context) (any, error) {
 			return factory(fctx)
@@ -253,10 +272,7 @@ func GetOrSet[T any](ctx context.Context, c *Cache, key string, factory func(con
 				c.logf("grace hit", "key", k, "err", r.Err)
 				return decodeValue[T](c, res.env)
 			}
-			if errors.Is(r.Err, ErrFactoryLimit) || errors.Is(r.Err, ErrClosed) {
-				return zero, r.Err
-			}
-			return zero, fmt.Errorf("gocache: factory: %w", r.Err)
+			return zero, factoryError(r.Err)
 		}
 		v, ok := r.Val.(T)
 		if !ok {

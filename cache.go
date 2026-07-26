@@ -125,7 +125,7 @@ func (c *Cache) Delete(ctx context.Context, key string) (bool, error) {
 	if err == nil {
 		c.emit(EventDeleted{Key: k})
 	}
-	c.publish("delete", []string{k}, "", "")
+	c.publish(opDelete, []string{k}, "", "")
 	if err != nil {
 		return false, err
 	}
@@ -158,7 +158,7 @@ func (c *Cache) DeleteMany(ctx context.Context, keys []string) error {
 			c.emit(EventDeleted{Key: k})
 		}
 	}
-	c.publish("delete", full, "", "")
+	c.publish(opDelete, full, "", "")
 	return err
 }
 
@@ -183,6 +183,6 @@ func (c *Cache) Clear(ctx context.Context) error {
 	if err == nil {
 		c.emit(EventCleared{Prefix: prefix})
 	}
-	c.publish("clear", nil, prefix, "")
+	c.publish(opClear, nil, prefix, "")
 	return err
 }

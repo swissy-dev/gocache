@@ -94,7 +94,7 @@ func TestEnqueueRetryDropsOldestOnOverflow(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	for i := 0; i < capacity; i++ {
+	for i := range capacity {
 		c.enqueueRetry([]byte{byte('0' + i)})
 	}
 	c.enqueueRetry([]byte{byte('0' + capacity)})

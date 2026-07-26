@@ -49,6 +49,7 @@ func runIntegration(t *testing.T, envVar, sqlDriver string, dialect Dialect) {
 
 	drivertest.Run(t, drivertest.Config{
 		New: func(t *testing.T) gocache.Driver {
+			t.Helper()
 			d := newDriver(t)
 			if err := d.ClearPrefix(context.Background(), ""); err != nil {
 				t.Fatal(err)

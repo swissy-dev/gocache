@@ -20,8 +20,7 @@ func TestPublishReachesSubscriber(t *testing.T) {
 
 	pub := New(pubClient)
 	sub := New(subClient)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	got := make(chan []byte, 1)
 	if err := sub.Subscribe(ctx, func(ctx context.Context, msg []byte) { got <- msg }); err != nil {

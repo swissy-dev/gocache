@@ -89,17 +89,17 @@ func (c *Cache) handleBusMsg(ctx context.Context, msg []byte) {
 		return
 	}
 	switch m.Op {
-	case "delete":
+	case opDelete:
 		c.rt.fence.invalidateMany(m.Keys)
 		if err := c.cfg.l1.DeleteMany(ctx, m.Keys); err != nil {
 			c.logf("bus delete failed", "err", err)
 		}
-	case "clear":
+	case opClear:
 		c.rt.fence.invalidateEverything()
 		if err := c.cfg.l1.ClearPrefix(ctx, m.Prefix); err != nil {
 			c.logf("bus clear failed", "err", err)
 		}
-	case "tag":
+	case opTag:
 		markerKey := c.tagKey(m.Tag)
 		c.rt.fence.invalidate(markerKey)
 		if _, err := c.cfg.l1.Delete(ctx, markerKey); err != nil {

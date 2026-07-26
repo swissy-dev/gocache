@@ -90,7 +90,7 @@ func (c *Cache) DeleteByTag(ctx context.Context, tags ...string) error {
 			}
 			c.emit(EventTagInvalidated{Tag: tag})
 		}
-		c.publish("tag", nil, "", tag)
+		c.publish(opTag, nil, "", tag)
 	}
 	return errors.Join(errs...)
 }

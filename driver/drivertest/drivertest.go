@@ -23,6 +23,7 @@ func (cfg Config) advance(t *testing.T, d time.Duration) {
 }
 
 func Run(t *testing.T, cfg Config) {
+	t.Helper()
 	t.Run("SetGet", func(t *testing.T) {
 		d := cfg.New(t)
 		ctx := context.Background()

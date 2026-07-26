@@ -1,3 +1,165 @@
 version: "2"
+run:
+  concurrency: 4
+  timeout: 5m
+  tests: true
+  build-tags:
+    - integration
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 50
+
 linters:
-  default: standard
+  enable:
+    # correctness
+    - govet
+    - staticcheck
+    - unused
+    - errcheck
+    - errorlint
+    - nilerr
+    - forcetypeassert
+    - copyloopvar
+    - durationcheck
+    - reassign
+    # style
+    - gocritic
+    - revive
+    - whitespace
+    - godot
+    - misspell
+    - dupword
+    - predeclared
+    - errname
+    - asciicheck
+    # complexity
+    - gocyclo
+    - nestif
+    - funlen
+    - dupl
+    # performance
+    - perfsprint
+    - unconvert
+    - ineffassign
+    - goconst
+    # security & resources
+    - gosec
+    - bidichk
+    - bodyclose
+    - noctx
+    - fatcontext
+    - sqlclosecheck
+    - rowserrcheck
+    # logging
+    - sloglint
+    - loggercheck
+    # testing
+    - testifylint
+    - thelper
+    - usetesting
+    # modernization & meta
+    - modernize
+    - exptostd
+    - intrange
+    - usestdlibvars
+    - exhaustive
+    - nolintlint
+
+  disable:
+    # --- project-specific disables (the rest are upstream defaults) ---
+    # wsl_v5: 426 findings, all blank-line placement. Pure churn, no correctness value.
+    - wsl_v5
+    # paralleltest: tests run in synctest bubbles and share driver instances;
+    # t.Parallel() would break bubble isolation and introduce real races.
+    - paralleltest
+    # containedctx: Cache, memorybus.Bus and sqldriver.Driver deliberately hold a
+    # lifetime context that Close() cancels. That is the design, not an accident.
+    - containedctx
+    # --- upstream defaults ---
+    - lll
+    - prealloc
+    - wrapcheck
+    - err113
+    - mnd
+    - iface
+    - nakedret
+    - noinlineerr
+    - gocognit
+    - cyclop
+    - depguard
+    - goheader
+    - importas
+    - funcorder
+    - godoclint
+    - varnamelen
+    - exhaustruct
+    - gochecknoglobals
+    - gochecknoinits
+    - unparam
+    - makezero
+    - testpackage
+    - embeddedstructfieldcheck
+    - iotamixing
+    - unqueryvet
+    - recvcheck
+    - mirror
+    - protogetter
+    - spancheck
+    - zerologlint
+
+  exclusions:
+    paths:
+      - vendor$
+      - third_party$
+    rules:
+      # Project convention is no code comments, so doc-comment rules cannot apply.
+      # unused-parameter fires on ctx params required by the Driver/Bus interfaces.
+      - linters: [revive]
+        text: "^(exported|package-comments|unused-parameter):"
+      # container/list stores any; the memory driver is the sole writer and only
+      # ever stores *entry. Scoped to that assertion so the check stays live elsewhere.
+      - linters: [errcheck, forcetypeassert]
+        path: driver/memory/memory.go
+        source: '\.\(\*entry\)'
+      # Lock backoff jitter is not security-sensitive; a CSPRNG here buys nothing.
+      - linters: [gosec]
+        path: lock.go
+        text: "G404"
+      # Test fixture strings ("ana", "stale") and long table-driven tests are fine.
+      - linters: [goconst, funlen, gocyclo, dupl, gosec]
+        path: _test\.go
+      # drivertest.Run is the driver conformance suite: one long sequence of
+      # independent t.Run behaviour checks. Known debt, tracked for a split.
+      - linters: [gocyclo, funlen]
+        path: driver/drivertest/drivertest\.go
+
+  settings:
+    dupl:
+      threshold: 100
+    errcheck:
+      check-type-assertions: true
+    funlen:
+      lines: 120
+      statements: 80
+    goconst:
+      min-len: 3
+      min-occurrences: 4
+    gocyclo:
+      min-complexity: 13
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+  settings:
+    gofumpt:
+      extra-rules: true
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$

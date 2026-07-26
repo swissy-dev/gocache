@@ -66,7 +66,7 @@ func buildQueries(d Dialect, table string) queries {
 		delIfEquals:   fmt.Sprintf("DELETE FROM %s WHERE %s = %s AND %s = %s AND (%s IS NULL OR %s > %s)", t, k, p(1), v, p(2), e, e, now),
 		deleteExpired: fmt.Sprintf("DELETE FROM %s WHERE %s = %s AND %s IS NOT NULL AND %s <= %s", t, k, p(1), e, e, now),
 		clearPrefix:   fmt.Sprintf("DELETE FROM %s WHERE %s LIKE %s %s", t, k, p(1), esc),
-		clearAll:      fmt.Sprintf("DELETE FROM %s", t),
+		clearAll:      "DELETE FROM " + t,
 	}
 	switch d {
 	case Postgres:
