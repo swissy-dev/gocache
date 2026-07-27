@@ -32,11 +32,9 @@ fifty happy callers.
 ```go
 var wg sync.WaitGroup
 for range 50 {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		_, _ = gocache.GetOrSet(ctx, cache, "hot", loadExpensiveThing)
-	}()
+	})
 }
 wg.Wait()
 ```
