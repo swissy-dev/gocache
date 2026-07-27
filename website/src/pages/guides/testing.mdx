@@ -154,15 +154,13 @@ var calls atomic.Int32
 
 var wg sync.WaitGroup
 for range 50 {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		_, _ = gocache.GetOrSet(ctx, cache, "hot", func(ctx context.Context) (int, error) {
 			calls.Add(1)
 			time.Sleep(10 * time.Millisecond)
 			return 1, nil
 		})
-	}()
+	})
 }
 wg.Wait()
 
