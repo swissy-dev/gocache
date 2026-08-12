@@ -1,3 +1,15 @@
+// Package drivertest provides the conformance suite that every gocache driver
+// must pass.
+//
+// A driver that satisfies [github.com/swissy-dev/gocache.Driver] compiles, but
+// compiling is not enough: the cache relies on semantics the type system cannot
+// state, such as an expired entry reporting as absent and Add being genuinely
+// atomic. [Run] checks those.
+//
+// Passing is necessary, not sufficient. The suite runs sequentially, so Add and
+// DeleteIfEquals are exercised but never actually raced; it never calls Close,
+// never passes DeleteMany an empty slice, and does not exercise metacharacter
+// escaping in ClearPrefix.
 package drivertest
 
 import (
@@ -8,8 +20,14 @@ import (
 	"github.com/swissy-dev/gocache"
 )
 
+// Config describes the driver under test.
 type Config struct {
-	New     func(t *testing.T) gocache.Driver
+	// New returns a fresh, empty driver for each subtest. It must not return a
+	// driver holding entries from a previous subtest.
+	New func(t *testing.T) gocache.Driver
+	// Advance moves the driver's clock forward. Leave it nil and the suite
+	// sleeps for real, which works for any backend expiring on the wall clock.
+	// Supply it for fakes and test doubles that expire on their own clock.
 	Advance func(t *testing.T, d time.Duration)
 }
 
@@ -22,6 +40,16 @@ func (cfg Config) advance(t *testing.T, d time.Duration) {
 	time.Sleep(d)
 }
 
+// Run executes the conformance suite against the driver cfg builds, as a set of
+// named subtests.
+//
+// Call it from an ordinary test function:
+//
+//	func TestConformance(t *testing.T) {
+//		drivertest.Run(t, drivertest.Config{
+//			New: func(t *testing.T) gocache.Driver { return New() },
+//		})
+//	}
 func Run(t *testing.T, cfg Config) {
 	t.Helper()
 	t.Run("SetGet", func(t *testing.T) { setGet(t, cfg) })

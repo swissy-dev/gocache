@@ -197,6 +197,14 @@ func decodeValue[T any](c *Cache, env envelope) (T, error) {
 	return v, nil
 }
 
+// Get returns the value stored under key, decoded into T.
+//
+// A miss returns the zero value of T and false with a nil error. An entry that
+// is present but logically expired is a miss, even when grace is configured;
+// grace only applies to [GetOrSet], which has a factory to fall back from.
+//
+// A non-nil error means the lookup itself failed — a tier was unreachable, or
+// the stored bytes could not be decoded into T.
 func Get[T any](ctx context.Context, c *Cache, key string) (T, bool, error) {
 	var zero T
 	if c.rt.isClosed.Load() {
@@ -219,6 +227,12 @@ func Get[T any](ctx context.Context, c *Cache, key string) (T, bool, error) {
 	return v, true, nil
 }
 
+// Set stores value under key, using the cache's default TTL unless [WithTTL]
+// overrides it.
+//
+// With both tiers configured the write goes to L2 first and fails the call if
+// L2 rejects it. An L1 failure is returned as an error but does not lose the
+// value, since L2 already holds it.
 func Set(ctx context.Context, c *Cache, key string, value any, opts ...CallOption) error {
 	if c.rt.isClosed.Load() {
 		return ErrClosed
@@ -236,6 +250,9 @@ func withForever(opts []CallOption) []CallOption {
 	return slices.Concat(opts, []CallOption{WithTTL(0)})
 }
 
+// SetForever stores value under key with no expiry, ignoring the cache's
+// default TTL. The entry still leaves when it is deleted, cleared, or evicted
+// by the driver's own capacity limits.
 func SetForever(ctx context.Context, c *Cache, key string, value any, opts ...CallOption) error {
 	return Set(ctx, c, key, value, withForever(opts)...)
 }
@@ -252,6 +269,20 @@ func factoryError(err error) error {
 	return fmt.Errorf("gocache: factory: %w", err)
 }
 
+// GetOrSet returns the cached value for key, calling factory to produce it on
+// a miss and storing the result.
+//
+// Concurrent misses for the same key are collapsed into a single factory call.
+// The factory runs on a context detached from any individual caller, so a
+// caller that gives up does not cancel work the others are waiting on; the
+// factory is instead bounded by the cache's lifetime and by [WithHardTimeout].
+//
+// If the factory fails and a logically expired value is still within its grace
+// window, that stale value is returned instead of the error — see [WithGrace].
+// [WithSoftTimeout] serves the stale value without waiting for a slow factory
+// to finish, letting it continue in the background.
+//
+// A factory panic is recovered and returned as an error.
 func GetOrSet[T any](ctx context.Context, c *Cache, key string, factory func(context.Context) (T, error), opts ...CallOption) (T, error) {
 	var zero T
 	if c.rt.isClosed.Load() {
@@ -303,6 +334,7 @@ func GetOrSet[T any](ctx context.Context, c *Cache, key string, factory func(con
 	}
 }
 
+// GetOrSetForever is [GetOrSet] with no expiry on the stored value.
 func GetOrSetForever[T any](ctx context.Context, c *Cache, key string, factory func(context.Context) (T, error), opts ...CallOption) (T, error) {
 	return GetOrSet(ctx, c, key, factory, withForever(opts)...)
 }
@@ -357,6 +389,16 @@ func (c *Cache) runFlight(callerCtx context.Context, fullKey string, factory fun
 	return val, nil
 }
 
+// Pull returns the value stored under key and then deletes it.
+//
+// The read and the delete are two separate operations, so Pull is not atomic:
+// concurrent callers can both observe the same value before either delete
+// lands. Do not use it where exactly-once delivery matters, such as consuming
+// a single-use token — take a [Cache.Lock] around the pair, or use a driver
+// operation built for it.
+//
+// If the delete fails the value is not returned, so a caller never sees a value
+// that is still cached.
 func Pull[T any](ctx context.Context, c *Cache, key string) (T, bool, error) {
 	v, ok, err := Get[T](ctx, c, key)
 	if err != nil || !ok {

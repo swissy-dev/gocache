@@ -45,6 +45,15 @@ func newOrigin() string {
 	return hex.EncodeToString(b)
 }
 
+// Close shuts the cache down: it stops accepting new work, waits for in-flight
+// factories and bus retries to finish, then closes the bus and both tiers.
+//
+// It is safe to call more than once and from multiple goroutines; every caller
+// blocks until the first shutdown finishes and they all receive the same error.
+// After Close, operations return [ErrClosed].
+//
+// Closing a namespaced view closes the cache it came from, since they share
+// the same tiers and bus.
 func (c *Cache) Close() error {
 	c.rt.closeOnce.Do(func() {
 		c.rt.trackMu.Lock()

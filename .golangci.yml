@@ -113,10 +113,10 @@ linters:
       - vendor$
       - third_party$
     rules:
-      # Project convention is no code comments, so doc-comment rules cannot apply.
-      # unused-parameter fires on ctx params required by the Driver/Bus interfaces.
+      # unused-parameter fires on ctx params required by the Driver/Bus interfaces,
+      # which cannot be dropped without breaking the interface.
       - linters: [revive]
-        text: "^(exported|package-comments|unused-parameter):"
+        text: "^unused-parameter:"
       # container/list stores any; the memory driver is the sole writer and only
       # ever stores *entry. Scoped to that assertion so the check stays live elsewhere.
       - linters: [errcheck, forcetypeassert]
