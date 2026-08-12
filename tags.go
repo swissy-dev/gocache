@@ -69,6 +69,16 @@ func (c *Cache) tagsValid(ctx context.Context, env envelope) (bool, error) {
 	return true, nil
 }
 
+// DeleteByTag invalidates every entry carrying any of the given tags.
+//
+// Entries are not visited or deleted. Each tag has a marker holding the time it
+// was last invalidated, and a read discards any entry created at or before its
+// tag's marker. Invalidation is therefore constant-time regardless of how many
+// entries carry the tag, but the entries themselves stay in the store until
+// they expire or are evicted.
+//
+// Tag markers are stored outside the namespace, so a tag invalidated on one
+// namespaced view is invalidated for every view of the same cache.
 func (c *Cache) DeleteByTag(ctx context.Context, tags ...string) error {
 	if c.rt.isClosed.Load() {
 		return ErrClosed

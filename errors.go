@@ -2,6 +2,8 @@ package gocache
 
 import "errors"
 
+// Sentinel errors returned by cache operations. Compare with [errors.Is];
+// operations wrap them with context.
 var (
 	ErrClosed       = errors.New("gocache: cache closed")
 	ErrFactoryLimit = errors.New("gocache: concurrent factory limit reached")

@@ -8,12 +8,20 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
+// Cache is a handle onto a configured set of tiers. It is safe for concurrent
+// use, and cheap to copy through [Cache.Namespace], which shares the tiers,
+// bus and configuration of the cache it came from.
 type Cache struct {
 	cfg *config
 	ns  string
 	rt  *runtime
 }
 
+// New builds a Cache from the given options. At least one tier is required;
+// see [WithL1] and [WithL2]. A [WithBus] requires both.
+//
+// The returned Cache owns background work — bus subscription and publish
+// retries — so it must be closed with [Cache.Close] when no longer needed.
 func New(opts ...Option) (*Cache, error) {
 	cfg := defaultConfig()
 	for _, opt := range opts {
@@ -44,6 +52,12 @@ func New(opts ...Option) (*Cache, error) {
 	return c, nil
 }
 
+// Namespace returns a view of the cache whose keys carry an additional
+// segment, so cache.Namespace("tenant-1") and cache.Namespace("tenant-2")
+// cannot see each other's entries.
+//
+// The view shares the parent's tiers, bus and configuration; closing either
+// closes both. Namespaces nest, and an empty name is a no-op.
 func (c *Cache) Namespace(name string) *Cache {
 	nc := *c
 	nc.ns = joinSegments(c.ns, escapeSegment(name))
@@ -88,6 +102,9 @@ func (c *Cache) logf(msg string, args ...any) {
 	c.cfg.logger.Warn("gocache: "+msg, args...)
 }
 
+// Has reports whether the key holds a value that is fresh right now. An entry
+// that is present but logically expired reports false, even when grace would
+// let [GetOrSet] serve it.
 func (c *Cache) Has(ctx context.Context, key string) (bool, error) {
 	if c.rt.isClosed.Load() {
 		return false, ErrClosed
@@ -99,6 +116,11 @@ func (c *Cache) Has(ctx context.Context, key string) (bool, error) {
 	return res.isFound && res.isFresh, nil
 }
 
+// Delete removes the key from every tier and reports whether it existed. An
+// entry that was present but already expired counts as absent.
+//
+// Both tiers are attempted even if the first fails; the errors are joined. On
+// error the boolean is false and carries no information about what was removed.
 func (c *Cache) Delete(ctx context.Context, key string) (bool, error) {
 	if c.rt.isClosed.Load() {
 		return false, ErrClosed
@@ -132,6 +154,9 @@ func (c *Cache) Delete(ctx context.Context, key string) (bool, error) {
 	return existed, nil
 }
 
+// DeleteMany removes several keys from every tier. Missing keys are not an
+// error. Both tiers are attempted even if the first fails, and the errors are
+// joined.
 func (c *Cache) DeleteMany(ctx context.Context, keys []string) error {
 	if c.rt.isClosed.Load() {
 		return ErrClosed
@@ -162,6 +187,12 @@ func (c *Cache) DeleteMany(ctx context.Context, keys []string) error {
 	return err
 }
 
+// Clear removes every entry in this cache's namespace from both tiers. On a
+// namespaced view it clears only that namespace; on the root cache it clears
+// everything under the configured key prefix, leaving other applications
+// sharing the same store untouched.
+//
+// Clear does not remove locks or tag markers.
 func (c *Cache) Clear(ctx context.Context) error {
 	if c.rt.isClosed.Load() {
 		return ErrClosed
