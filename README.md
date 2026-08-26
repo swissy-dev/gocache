@@ -1,5 +1,7 @@
 # gocache
 
+[![Codacy Badge](https://api.codacy.com/project/badge/Grade/5f90961f9c954dd2b8dafee4b6c8b0db)](https://app.codacy.com/gh/swissy-dev/gocache?utm_source=github.com&utm_medium=referral&utm_content=swissy-dev/gocache&utm_campaign=Badge_Grade)
+
 Multi-tier caching for Go: an in-memory L1 in front of a distributed L2, kept in sync across
 instances by a message bus. Namespaces, tag invalidation, stampede protection, grace periods,
 factory timeouts and distributed atomic locks.
