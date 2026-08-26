@@ -34,12 +34,29 @@ func WithMaxEntries(n int) Option {
 	return func(d *Driver) { d.maxEntries = n }
 }
 
+// WithMaxBytes caps the total size of the entries the driver holds, counting
+// each entry's key and value. Zero, the default, leaves it uncapped and bounds
+// the driver by [WithMaxEntries] alone.
+//
+// An entry count is a poor proxy for memory when values vary in size: ten
+// thousand one-kilobyte entries and ten thousand one-megabyte entries both sit
+// under the same entry limit. Set this when the values are not uniform.
+//
+// The budget counts stored payload, not process memory — per-entry map, list
+// and struct overhead is real but not counted, so leave headroom. A value
+// larger than the whole budget is not retained.
+func WithMaxBytes(n int64) Option {
+	return func(d *Driver) { d.maxBytes = n }
+}
+
 // Driver is an in-process cache with LRU eviction. Use [New] to create one. It
 // is safe for concurrent use, guarded by a single mutex, so it serialises
 // access across all keys.
 type Driver struct {
 	mu         sync.Mutex
 	maxEntries int
+	maxBytes   int64
+	bytes      int64
 	items      map[string]*list.Element
 	lru        *list.List
 }
@@ -48,6 +65,10 @@ type entry struct {
 	key       string
 	value     []byte
 	expiresAt time.Time
+}
+
+func (e *entry) size() int64 {
+	return int64(len(e.key) + len(e.value))
 }
 
 func (e *entry) isExpired(now time.Time) bool {
@@ -109,22 +130,40 @@ func (d *Driver) set(key string, value []byte, ttl time.Duration) {
 	if ttl > 0 {
 		exp = now.Add(ttl)
 	}
+	if d.maxBytes > 0 && int64(len(key)+len(v)) > d.maxBytes {
+		if el, ok := d.items[key]; ok {
+			d.remove(el)
+		}
+		return
+	}
 	if el, ok := d.items[key]; ok {
 		en := el.Value.(*entry)
+		d.bytes += int64(len(v)) - int64(len(en.value))
 		en.value = v
 		en.expiresAt = exp
 		d.lru.MoveToFront(el)
+		d.evict(now)
 		return
 	}
-	el := d.lru.PushFront(&entry{key: key, value: v, expiresAt: exp})
-	d.items[key] = el
-	if len(d.items) > d.maxEntries {
-		d.reclaimExpiredFromColdEnd(now, expiryScanWindow)
+	en := &entry{key: key, value: v, expiresAt: exp}
+	d.items[key] = d.lru.PushFront(en)
+	d.bytes += en.size()
+	d.evict(now)
+}
+
+func (d *Driver) overBudget() bool {
+	return len(d.items) > d.maxEntries || (d.maxBytes > 0 && d.bytes > d.maxBytes)
+}
+
+func (d *Driver) evict(now time.Time) {
+	if !d.overBudget() {
+		return
 	}
-	for len(d.items) > d.maxEntries {
+	d.reclaimExpiredFromColdEnd(now, expiryScanWindow)
+	for d.overBudget() {
 		back := d.lru.Back()
 		if back == nil {
-			break
+			return
 		}
 		d.remove(back)
 	}
@@ -219,6 +258,7 @@ func (d *Driver) Close() error {
 
 func (d *Driver) remove(el *list.Element) {
 	en := el.Value.(*entry)
+	d.bytes -= en.size()
 	d.lru.Remove(el)
 	delete(d.items, en.key)
 }

@@ -22,11 +22,34 @@ memory.New(memory.WithMaxEntries(50_000))
 The number of entries to hold before evicting the least recently used one. Defaults to 10,000.
 
 This counts **entries, not bytes**. Ten thousand small structs and ten thousand rendered HTML pages
-are very different amounts of memory, so size it against what you actually store. If you cache large
-values, either lower it or measure.
+are very different amounts of memory. If your values vary in size, bound the driver with
+[`WithMaxBytes`](#withmaxbytes) as well.
 
 A value below 1 is clamped to 1 — a driver that evicts everything it stores would be a silent
 misconfiguration rather than a useful setting.
+
+### WithMaxBytes
+
+```go
+memory.New(
+	memory.WithMaxEntries(50_000),
+	memory.WithMaxBytes(256<<20), // 256 MiB
+)
+```
+
+The total size of the entries to hold, counting each entry's key and value. Defaults to 0, which
+leaves the driver bounded by the entry count alone.
+
+Both bounds apply when both are set: whichever is reached first triggers eviction, and the least
+recently used entry goes either way.
+
+:::warning[The budget counts payload, not process memory]
+Each entry also costs map, list and struct overhead that this does not count, so the driver's real
+footprint is larger than the budget. Leave headroom rather than setting it to the memory you have.
+
+A value larger than the entire budget is not retained — `Set` reports success and the next `Get`
+misses, because nothing that size can fit.
+:::
 
 ## Behaviour
 
@@ -68,8 +91,10 @@ if you profile a hot path down to this, sharding across several caches by key is
 
 ## Memory use
 
-Nothing is bounded except entry count. gocache stores the JSON envelope, so an entry's footprint is
-your value's serialised size plus the envelope overhead plus map and list bookkeeping.
+The driver bounds what it stores by entry count, and by payload size when
+[`WithMaxBytes`](#withmaxbytes) is set. Neither bounds process memory directly: gocache stores the
+JSON envelope, so an entry's real footprint is your value's serialised size plus the envelope
+overhead plus map and list bookkeeping.
 
 Two things that catch people out:
 
