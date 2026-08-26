@@ -1,5 +1,19 @@
 # Getting started
 
+:::warning[Early and unstable — do not depend on this yet]
+There is no tagged release, and none of the API is settled.
+
+Most of the code was written by an AI agent. The design was directed by a human, but the initial
+implementation was never reviewed line by line, and a lot of it is expected to change as the
+remaining pieces are built properly. Assume anything documented here can move: names, signatures,
+defaults and behaviour.
+
+There is real verification behind it — race-detector runs on Go 1.25 and 1.26, a driver conformance
+suite against real Postgres, MySQL and Redis, fuzz targets, and 45 linters. That catches races,
+unchecked errors and broken invariants under fuzzed input. It is not evidence that the code has been
+read carefully end to end, because it hasn't been.
+:::
+
 gocache is a multi-tier cache for Go. An in-memory L1 sits in front of a shared L2 — Redis or your
 SQL database — and a message bus keeps every instance's L1 honest when data changes.
 
