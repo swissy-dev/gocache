@@ -8,6 +8,8 @@ import (
 	"math"
 	"slices"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 type readResult struct {
@@ -36,40 +38,61 @@ func (c *Cache) readTier(ctx context.Context, d Driver, fullKey string) (envelop
 	return env, true, nil
 }
 
+type l1Read struct {
+	result   readResult
+	fallback readResult
+	resolved bool
+}
+
 func (c *Cache) read(ctx context.Context, fullKey string) (readResult, error) {
 	now := c.cfg.clock()
-	var staleL1 readResult
-	if c.cfg.l1 != nil {
-		env, ok, err := c.readTier(ctx, c.cfg.l1, fullKey)
-		if err != nil {
-			return readResult{}, err
-		}
-		if ok && env.isFresh(now) {
-			return readResult{env: env, isFound: true, isFresh: true, tier: TierL1}, nil
-		}
-		if c.cfg.l2 == nil {
-			return readResult{env: env, isFound: ok, tier: TierL1}, nil
-		}
-		if ok {
-			staleL1 = readResult{env: env, isFound: true, tier: TierL1}
-		}
+	l1, err := c.readL1(ctx, fullKey, now)
+	if err != nil {
+		return readResult{}, err
 	}
-	if c.cfg.l2 != nil {
-		gen := c.rt.fence.generation(fullKey)
-		env, ok, err := c.readTier(ctx, c.cfg.l2, fullKey)
-		if err != nil {
-			return readResult{}, err
-		}
-		if !ok {
-			return staleL1, nil
-		}
-		if env.isFresh(now) {
-			c.backfillL1(ctx, fullKey, env, now, gen)
-			return readResult{env: env, isFound: true, isFresh: true, tier: TierL2}, nil
-		}
-		return readResult{env: env, isFound: true, tier: TierL2}, nil
+	if l1.resolved {
+		return l1.result, nil
 	}
-	return readResult{}, nil
+	if c.cfg.l2 == nil {
+		return readResult{}, nil
+	}
+	return c.readL2(ctx, fullKey, now, l1.fallback)
+}
+
+func (c *Cache) readL1(ctx context.Context, fullKey string, now time.Time) (l1Read, error) {
+	if c.cfg.l1 == nil {
+		return l1Read{}, nil
+	}
+	env, ok, err := c.readTier(ctx, c.cfg.l1, fullKey)
+	if err != nil {
+		return l1Read{}, err
+	}
+	if ok && env.isFresh(now) {
+		return l1Read{result: readResult{env: env, isFound: true, isFresh: true, tier: TierL1}, resolved: true}, nil
+	}
+	if c.cfg.l2 == nil {
+		return l1Read{result: readResult{env: env, isFound: ok, tier: TierL1}, resolved: true}, nil
+	}
+	if ok {
+		return l1Read{fallback: readResult{env: env, isFound: true, tier: TierL1}}, nil
+	}
+	return l1Read{}, nil
+}
+
+func (c *Cache) readL2(ctx context.Context, fullKey string, now time.Time, staleL1 readResult) (readResult, error) {
+	gen := c.rt.fence.generation(fullKey)
+	env, ok, err := c.readTier(ctx, c.cfg.l2, fullKey)
+	if err != nil {
+		return readResult{}, err
+	}
+	if !ok {
+		return staleL1, nil
+	}
+	if env.isFresh(now) {
+		c.backfillL1(ctx, fullKey, env, now, gen)
+		return readResult{env: env, isFound: true, isFresh: true, tier: TierL2}, nil
+	}
+	return readResult{env: env, isFound: true, tier: TierL2}, nil
 }
 
 func (c *Cache) backfillL1(ctx context.Context, fullKey string, env envelope, now time.Time, gen uint64) {
@@ -269,6 +292,31 @@ func factoryError(err error) error {
 	return fmt.Errorf("gocache: factory: %w", err)
 }
 
+func softTimeout(o callOpts, graced bool) (<-chan time.Time, func()) {
+	if o.soft > 0 && graced {
+		timer := time.NewTimer(o.soft)
+		return timer.C, func() { timer.Stop() }
+	}
+	return nil, func() {}
+}
+
+func flightValue[T any](c *Cache, fullKey string, r singleflight.Result, res readResult, graced bool) (T, error) {
+	var zero T
+	if r.Err != nil {
+		if graced {
+			c.emit(EventGraceHit{Key: fullKey, Err: r.Err})
+			c.logf("grace hit", "key", fullKey, "err", r.Err)
+			return decodeValue[T](c, res.env)
+		}
+		return zero, factoryError(r.Err)
+	}
+	v, ok := r.Val.(T)
+	if !ok {
+		return zero, fmt.Errorf("gocache: type mismatch for key %q", fullKey)
+	}
+	return v, nil
+}
+
 // GetOrSet returns the cached value for key, calling factory to produce it on
 // a miss and storing the result.
 //
@@ -305,27 +353,11 @@ func GetOrSet[T any](ctx context.Context, c *Cache, key string, factory func(con
 			return factory(fctx)
 		}, o)
 	})
-	var softC <-chan time.Time
-	if o.soft > 0 && graced {
-		timer := time.NewTimer(o.soft)
-		defer timer.Stop()
-		softC = timer.C
-	}
+	softC, stopSoft := softTimeout(o, graced)
+	defer stopSoft()
 	select {
 	case r := <-ch:
-		if r.Err != nil {
-			if graced {
-				c.emit(EventGraceHit{Key: k, Err: r.Err})
-				c.logf("grace hit", "key", k, "err", r.Err)
-				return decodeValue[T](c, res.env)
-			}
-			return zero, factoryError(r.Err)
-		}
-		v, ok := r.Val.(T)
-		if !ok {
-			return zero, fmt.Errorf("gocache: type mismatch for key %q", k)
-		}
-		return v, nil
+		return flightValue[T](c, k, r, res, graced)
 	case <-softC:
 		c.emit(EventGraceHit{Key: k})
 		return decodeValue[T](c, res.env)
@@ -339,21 +371,23 @@ func GetOrSetForever[T any](ctx context.Context, c *Cache, key string, factory f
 	return GetOrSet(ctx, c, key, factory, withForever(opts)...)
 }
 
+func (c *Cache) recoverFlight(fullKey string, err *error) {
+	if p := recover(); p != nil {
+		*err = fmt.Errorf("gocache: factory panic: %v", p)
+		c.emit(EventFactoryError{Key: fullKey, Err: *err})
+		c.logf("factory panic", "key", fullKey, "panic", p)
+	}
+	if *err != nil {
+		c.rt.sf.Forget(fullKey)
+	}
+}
+
 func (c *Cache) runFlight(callerCtx context.Context, fullKey string, factory func(context.Context) (any, error), o callOpts) (v any, err error) {
 	if !c.rt.track() {
 		return nil, ErrClosed
 	}
 	defer c.rt.wg.Done()
-	defer func() {
-		if p := recover(); p != nil {
-			err = fmt.Errorf("gocache: factory panic: %v", p)
-			c.emit(EventFactoryError{Key: fullKey, Err: err})
-			c.logf("factory panic", "key", fullKey, "panic", p)
-		}
-		if err != nil {
-			c.rt.sf.Forget(fullKey)
-		}
-	}()
+	defer c.recoverFlight(fullKey, &err)
 	fctx, cancel := context.WithCancel(context.WithoutCancel(callerCtx))
 	defer cancel()
 	stop := context.AfterFunc(c.rt.ctx, cancel)

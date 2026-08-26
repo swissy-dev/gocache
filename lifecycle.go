@@ -97,6 +97,10 @@ func (c *Cache) handleBusMsg(ctx context.Context, msg []byte) {
 	if c.cfg.l1 == nil {
 		return
 	}
+	c.applyBusOp(ctx, m)
+}
+
+func (c *Cache) applyBusOp(ctx context.Context, m busMsg) {
 	switch m.Op {
 	case opDelete:
 		c.rt.fence.invalidateMany(m.Keys)

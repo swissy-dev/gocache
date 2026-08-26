@@ -123,22 +123,8 @@ func New(db *sql.DB, dialect Dialect, opts ...Option) (*Driver, error) {
 	for _, opt := range opts {
 		opt(d)
 	}
-	switch d.dialect {
-	case Postgres, MySQL, SQLite:
-	default:
-		return nil, fmt.Errorf("sqldriver: unknown dialect %q", d.dialect)
-	}
-	if !identPattern.MatchString(d.table) {
-		return nil, fmt.Errorf("sqldriver: invalid table name %q", d.table)
-	}
-	if d.sweepInterval < 0 {
-		return nil, errors.New("sqldriver: sweep interval must not be negative")
-	}
-	if d.sweepBatch < 1 {
-		return nil, errors.New("sqldriver: sweep batch size must be positive")
-	}
-	if d.sweepTimeout < 1 {
-		return nil, errors.New("sqldriver: sweep timeout must be positive")
+	if err := d.validate(); err != nil {
+		return nil, err
 	}
 	if d.logger == nil {
 		d.logger = slog.New(slog.DiscardHandler)
@@ -150,6 +136,27 @@ func New(db *sql.DB, dialect Dialect, opts ...Option) (*Driver, error) {
 		go d.sweepLoop()
 	}
 	return d, nil
+}
+
+func (d *Driver) validate() error {
+	switch d.dialect {
+	case Postgres, MySQL, SQLite:
+	default:
+		return fmt.Errorf("sqldriver: unknown dialect %q", d.dialect)
+	}
+	if !identPattern.MatchString(d.table) {
+		return fmt.Errorf("sqldriver: invalid table name %q", d.table)
+	}
+	if d.sweepInterval < 0 {
+		return errors.New("sqldriver: sweep interval must not be negative")
+	}
+	if d.sweepBatch < 1 {
+		return errors.New("sqldriver: sweep batch size must be positive")
+	}
+	if d.sweepTimeout < 1 {
+		return errors.New("sqldriver: sweep timeout must be positive")
+	}
+	return nil
 }
 
 // Schema returns the statements that create the cache table and its indexes
