@@ -436,3 +436,51 @@ func TestLockRejectsNonPositiveTTL(t *testing.T) {
 		t.Fatalf("a valid lock must still acquire: ok=%v err=%v", ok, err)
 	}
 }
+
+func TestLockReleaseFailureIsObservable(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var failures []EventLockReleaseFailed
+		c, err := New(
+			WithL1(memory.New()),
+			WithEventHook(func(e Event) {
+				if f, ok := e.(EventLockReleaseFailed); ok {
+					mu.Lock()
+					failures = append(failures, f)
+					mu.Unlock()
+				}
+			}),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = c.Close() }()
+		ctx := context.Background()
+
+		l := c.Lock("job", time.Second)
+		if ok, err := l.Acquire(ctx); err != nil || !ok {
+			t.Fatalf("acquire ok=%v err=%v", ok, err)
+		}
+
+		time.Sleep(2 * time.Second)
+		if ok, err := c.Lock("job", time.Second).Acquire(ctx); err != nil || !ok {
+			t.Fatalf("a lapsed lease must be acquirable: ok=%v err=%v", ok, err)
+		}
+
+		if err := l.Release(ctx); err != nil {
+			t.Fatalf("releasing a lost lease reports success, got %v", err)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(failures) != 1 {
+			t.Fatalf("expected one release failure event, got %d", len(failures))
+		}
+		if failures[0].Key != c.lockKey("job") {
+			t.Fatalf("event carries key %q", failures[0].Key)
+		}
+		if failures[0].Err == nil {
+			t.Fatal("the event must say why the release failed")
+		}
+	})
+}

@@ -66,5 +66,6 @@
 // shared with the parent.
 //
 // Full documentation, including driver-specific guidance and worked examples,
-// is at https://github.com/swissy-dev/gocache.
+// is at https://gocache-black.vercel.app. Source and issues live at
+// https://github.com/swissy-dev/gocache.
 package gocache

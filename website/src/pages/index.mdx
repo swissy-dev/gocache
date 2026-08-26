@@ -63,6 +63,11 @@ type Article struct {
 	Title string `json:"title"`
 }
 
+// Stand-in for whatever you actually load from — a database, an API, a file.
+func loadArticle(ctx context.Context, id int) (Article, error) {
+	return Article{ID: id, Title: "Hello"}, nil
+}
+
 func main() {
 	cache, err := gocache.New(
 		gocache.WithL1(memory.New(memory.WithMaxEntries(10_000))),

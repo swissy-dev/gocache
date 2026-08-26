@@ -330,6 +330,12 @@ func flightValue[T any](c *Cache, fullKey string, r singleflight.Result, res rea
 // [WithSoftTimeout] serves the stale value without waiting for a slow factory
 // to finish, letting it continue in the background.
 //
+// Caching is best effort: if the factory succeeds but storing the result
+// fails, GetOrSet still returns the value with a nil error, having reported
+// the failure through [EventWriteFailed] and the logger. The next call for the
+// same key will therefore miss again and re-run the factory. Watch that event
+// if you need to know the cache is not actually being populated.
+//
 // A factory panic is recovered and returned as an error.
 func GetOrSet[T any](ctx context.Context, c *Cache, key string, factory func(context.Context) (T, error), opts ...CallOption) (T, error) {
 	var zero T

@@ -52,7 +52,7 @@ type EventCleared struct {
 	Prefix string
 }
 
-// EventTagInvalidated reports a tag marked invalid by Cache.DeleteByTag. No
+// EventTagInvalidated reports a tag marked invalid by [Cache.DeleteByTag]. No
 // entries are visited, so the number affected is not known.
 type EventTagInvalidated struct {
 	Tag string
@@ -108,9 +108,23 @@ type EventLockAcquired struct {
 
 // EventLockReleased reports a lock lease given up by its owner. It is not
 // emitted when the lease had already expired and been taken by someone else, or
-// for Lock.ForceRelease.
+// for [Lock.ForceRelease].
 type EventLockReleased struct {
 	Key string
+}
+
+// EventLockReleaseFailed reports a lock its owner could not give back, which
+// leaves it held until the lease expires.
+//
+// Err says which happened: the driver rejected the release, or the lease had
+// already expired and been taken by another process — meaning the protected
+// work overran its ttl and may have run alongside someone else's.
+//
+// This is the only signal for a release that [Lock.Do] swallowed, and for the
+// lost-lease case that [Lock.Release] reports as success.
+type EventLockReleaseFailed struct {
+	Key string
+	Err error
 }
 
 func (EventHit) event()                {}
@@ -126,3 +140,4 @@ func (EventBusPublishFailed) event()   {}
 func (EventBusMessageReceived) event() {}
 func (EventLockAcquired) event()       {}
 func (EventLockReleased) event()       {}
+func (EventLockReleaseFailed) event()  {}

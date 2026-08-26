@@ -161,7 +161,7 @@ func (d *Driver) validate() error {
 
 // Schema returns the statements that create the cache table and its indexes
 // for the configured dialect, so they can be folded into an existing migration
-// tool instead of running Driver.Migrate.
+// tool instead of running [Driver.Migrate].
 func (d *Driver) Schema() []string {
 	return slices.Clone(d.q.schema)
 }
