@@ -13,6 +13,30 @@ user, err := gocache.GetOrSet(ctx, cache, "user:42", func(ctx context.Context) (
 One database call per instance, no matter how many goroutines ask at once. Served from process
 memory on the way back. Invalidated everywhere with `cache.DeleteByTag(ctx, "users")`.
 
+## Status — early, unstable, largely AI-written
+
+**Do not depend on this yet.** There is no tagged release, and none of the API is settled.
+
+Most of the code was written by an AI agent. The design was directed by a human, but the initial
+implementation was never reviewed line by line, and a lot of it is expected to change as the
+remaining pieces are built properly. Assume anything here can move: names, signatures, defaults and
+behaviour.
+
+Automated verification does exist, and it is not nothing:
+
+- Unit tests under the race detector, on both Go 1.25 and 1.26.
+- A driver conformance suite run against real Postgres, MySQL and Redis, plus a three-master Redis
+  cluster — not mocks standing in for them.
+- Fuzz targets over key generation, bus message decoding and envelope decoding. One of them found a
+  TTL overflow that made a very long TTL silently expire after a millisecond.
+- `golangci-lint` with 45 linters, including the security and concurrency checks.
+- Adversarial reviews that found real bugs — but scoped to individual changes, not a full audit of
+  the codebase.
+
+That catches a particular class of mistake: races, unchecked errors, broken invariants under fuzzed
+input. It is not evidence that the code has been read carefully end to end, because it hasn't been.
+Read it yourself before trusting it with anything that matters.
+
 ## Install
 
 ```bash
