@@ -10,7 +10,7 @@ import (
 )
 
 // Lock is a distributed mutex held in the authoritative tier. Obtain one with
-// Cache.Lock.
+// [Cache.Lock].
 //
 // A Lock records the token of the lease it currently holds, so a release only
 // removes a lease this Lock still owns. That makes it safe for a lock whose TTL
@@ -26,7 +26,7 @@ type Lock struct {
 }
 
 // Lock returns a distributed lock named within this cache's namespace. It
-// acquires nothing; call [Lock.Acquire], [Lock.Block] or Lock.Do.
+// acquires nothing; call [Lock.Acquire], [Lock.Block] or [Lock.Do].
 //
 // The lock lives in the authoritative tier, so it coordinates across every
 // instance pointed at the same L2. With only an L1 configured it is
@@ -34,6 +34,13 @@ type Lock struct {
 //
 // ttl bounds how long the lock survives without being released, so a process
 // that dies holding it cannot block others forever. It must be positive.
+//
+// The lease is never renewed. Exclusion holds only while it is valid: work that
+// outruns its ttl loses the lock, and another process can acquire it while the
+// first is still running. Size ttl above the worst case you are willing to
+// tolerate, and do not treat this as a guarantee that protected work never
+// overlaps. [Lock.Release] will not delete a lease that has since been taken by
+// someone else, so an overrun is at worst duplicated work, not a stolen lock.
 func (c *Cache) Lock(name string, ttl time.Duration) *Lock {
 	return &Lock{
 		cache: c,
@@ -104,6 +111,8 @@ func (l *Lock) Release(ctx context.Context) error {
 		return fmt.Errorf("gocache: lock release: %w", err)
 	}
 	if !ok {
+		lost := fmt.Errorf("gocache: lock lease for %q expired and was taken by another process", l.key)
+		l.cache.emit(EventLockReleaseFailed{Key: l.key, Err: lost})
 		l.cache.logf("lock no longer owned at release", "key", l.key)
 		return nil
 	}
@@ -133,7 +142,7 @@ func (l *Lock) ForceRelease(ctx context.Context) error {
 // timeout is reached, or the context's error if ctx ends first.
 //
 // The caller holds the lock when Block returns nil and is responsible for
-// calling Lock.Release.
+// calling [Lock.Release].
 func (l *Lock) Block(ctx context.Context, timeout time.Duration) error {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
@@ -189,6 +198,7 @@ func (l *Lock) Do(ctx context.Context, fn func(context.Context) error) error {
 	}
 	defer func() {
 		if rerr := l.Release(context.WithoutCancel(ctx)); rerr != nil {
+			l.cache.emit(EventLockReleaseFailed{Key: l.key, Err: rerr})
 			l.cache.logf("lock release failed", "key", l.key, "err", rerr)
 		}
 	}()

@@ -266,8 +266,15 @@ func WithLogger(l *slog.Logger) Option {
 
 // WithMaxConcurrentFactories caps how many [GetOrSet] factories may run at
 // once across the cache, defaulting to 1024. It is a backstop against a cold
-// cache spawning unbounded work, not a tuning knob. Calls beyond the limit fail
-// with [ErrFactoryLimit]. It must be positive.
+// cache spawning unbounded work, not a tuning knob. It must be positive.
+//
+// Past the ceiling a flight waits for a slot rather than failing, so the
+// caller's own context is what bounds the wait. Only when that context ends
+// first — cancelled, or past its deadline — does the call return
+// [ErrFactoryLimit], with the context's error wrapped inside it.
+//
+// One slot covers a whole flight, so many callers collapsed onto one key
+// consume one slot between them, not one each.
 func WithMaxConcurrentFactories(n int) Option {
 	return func(cfg *config) error {
 		if n < 1 {
