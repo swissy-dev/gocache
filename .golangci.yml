@@ -148,7 +148,7 @@ linters:
       min-len: 3
       min-occurrences: 4
     gocyclo:
-      min-complexity: 13
+      min-complexity: 9
     nolintlint:
       require-explanation: true
       require-specific: true

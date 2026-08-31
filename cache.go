@@ -127,29 +127,26 @@ func (c *Cache) Delete(ctx context.Context, key string) (bool, error) {
 	}
 	k := c.key(key)
 	c.rt.fence.invalidate(k)
-	var existed bool
-	var errs []error
-	if c.cfg.l2 != nil {
-		ok, err := c.cfg.l2.Delete(ctx, k)
-		existed = existed || ok
-		if err != nil {
-			errs = append(errs, fmt.Errorf("gocache: l2 delete: %w", err))
-		}
-	}
-	if c.cfg.l1 != nil {
-		ok, err := c.cfg.l1.Delete(ctx, k)
-		existed = existed || ok
-		if err != nil {
-			errs = append(errs, fmt.Errorf("gocache: l1 delete: %w", err))
-		}
-	}
-	err := errors.Join(errs...)
+	existedL2, errL2 := deleteFromTier(ctx, c.cfg.l2, "l2", k)
+	existedL1, errL1 := deleteFromTier(ctx, c.cfg.l1, "l1", k)
+	err := errors.Join(errL2, errL1)
 	if err == nil {
 		c.emit(EventDeleted{Key: k})
 	}
 	c.publish(opDelete, []string{k}, "", "")
 	if err != nil {
 		return false, err
+	}
+	return existedL2 || existedL1, nil
+}
+
+func deleteFromTier(ctx context.Context, d Driver, tier, fullKey string) (bool, error) {
+	if d == nil {
+		return false, nil
+	}
+	existed, err := d.Delete(ctx, fullKey)
+	if err != nil {
+		return existed, fmt.Errorf("gocache: %s delete: %w", tier, err)
 	}
 	return existed, nil
 }

@@ -13,6 +13,8 @@ user, err := gocache.GetOrSet(ctx, cache, "user:42", func(ctx context.Context) (
 One database call per instance, no matter how many goroutines ask at once. Served from process
 memory on the way back. Invalidated everywhere with `cache.DeleteByTag(ctx, "users")`.
 
+Documentation: **https://gocache-black.vercel.app**
+
 ## Status — early, unstable, largely AI-written
 
 **Do not depend on this yet.** There is no tagged release, and none of the API is settled.
@@ -306,7 +308,8 @@ your `Release` can't delete their lock — and once a lease ends its token is re
 
 ## Surviving a bad day
 
-Two independent settings. Grace is off by default; of the two timeouts, only the soft one is.
+Two independent settings, and the defaults differ: grace is off, the soft timeout is off, and the
+hard timeout is 30 seconds.
 
 **Grace** — when the database your factory reads from is down, serve stale data rather than
 failing:
